@@ -1,0 +1,31 @@
+{
+  "name": "gta7",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GTA7 - an open-world city driving game built on WebGL2 (Three.js) with advanced shading, anti-aliasing and low-spec scalability.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173 --strictPort",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test -c e2e/playwright.config.ts",
+    "verify": "npm run typecheck && npm run test && npm run build && npm run e2e"
+  },
+  "dependencies": {
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "^22.15.0",
+    "@types/three": "0.185.4",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

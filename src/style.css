@@ -1,0 +1,10 @@
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0b0f1a; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+#game { display: block; width: 100vw; height: 100vh; outline: none; }
+#hud { position: fixed; inset: 0; pointer-events: none; color: #f2f2f2; text-shadow: 0 1px 2px rgba(0,0,0,0.8); }
+.hud { position: absolute; inset: 0; }
+.hud-speed { position: absolute; right: 24px; bottom: 20px; font-variant-numeric: tabular-nums; }
+.hud-speed-value { font-size: 52px; font-weight: 700; letter-spacing: -1px; }
+.hud-speed-unit { font-size: 14px; margin-left: 6px; opacity: 0.8; text-transform: uppercase; }
+.hud-perf { position: absolute; left: 12px; top: 10px; font-size: 12px; opacity: 0.85; font-variant-numeric: tabular-nums; }
+.hud-hint { position: absolute; left: 12px; bottom: 14px; font-size: 13px; opacity: 0.85; }
+.hud-toast { position: absolute; left: 50%; top: 14%; transform: translateX(-50%); padding: 8px 16px; background: rgba(10,12,20,0.7); border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; font-size: 15px; }
