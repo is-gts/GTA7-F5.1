@@ -11,6 +11,7 @@ import { detectQualityPreset, getPreset, isPresetName, saveQuality, type Quality
 import { CameraRig } from '../entities/CameraRig';
 import { PlayerEntity } from '../entities/PlayerEntity';
 import { VehicleEntity } from '../entities/VehicleEntity';
+import { pickVehiclePaint, pickVehicleType } from '../entities/VehicleCatalog';
 import { StaticColliderGrid, type OBB } from '../physics/Collision';
 import { resolveVehicleVehicle, type VehicleSpec, type VehicleState } from '../physics/VehiclePhysics';
 import { GameRenderer } from '../render/GameRenderer';
@@ -18,6 +19,7 @@ import { Lighting } from '../render/Lighting';
 import { MaterialRegistry } from '../render/MaterialRegistry';
 import { SkyDome } from '../render/SkyDome';
 import { HUD } from '../ui/HUD';
+import { Random } from '../world/Random';
 import { buildCity, type CityView } from '../world/CityBuilder';
 import { buildingAABBs, generateCity, lanePoint, type CityData, type CityParams } from '../world/CityGenerator';
 
@@ -37,11 +39,14 @@ export type PlayerMode = 'foot' | 'vehicle';
 /** Max distance (m) from the player to a car's centre to enter it. */
 export const ENTER_VEHICLE_RADIUS = 5.5;
 
-const CAR_COLOURS = [0xc0392b, 0x2980b9, 0xf1c40f, 0x2c3e50, 0xecf0f1, 0x27ae60, 0x8e44ad, 0xe67e22];
+/** Radius (m) around a honking vehicle within which pedestrians are startled into fleeing. */
+const HORN_RADIUS = 18;
 
 export interface GameEvents {
   /** A pedestrian was struck by a vehicle moving faster than the knockdown threshold. */
   pedestrianHit: { speed: number };
+  /** The player leaned on the horn (H) while driving. */
+  horn: { x: number; z: number; heading: number };
   [key: string]: unknown;
 }
 
@@ -89,6 +94,8 @@ export class Game {
   private readonly storage: Storage | null;
   private readonly dpr: number;
   private hint = '';
+  /** Deterministic RNG for vehicle-type/paint choices, seeded from the city seed. */
+  private readonly vehicleRng: Random;
 
   constructor(private readonly opts: GameOptions) {
     this.storage = opts.storage ?? null;
@@ -104,6 +111,7 @@ export class Game {
     this.lighting = new Lighting(this.scene, this.camera, this.registry, this.quality);
 
     this.city = generateCity(opts.city);
+    this.vehicleRng = new Random(this.city.params.seed ^ 0x5eed1);
     this.grid = new StaticColliderGrid(32);
     for (const box of buildingAABBs(this.city)) this.grid.insert(box);
     this.cityView = buildCity(this.city, this.quality, this.registry, this.gfx.maxAnisotropy);
@@ -121,6 +129,8 @@ export class Game {
     this.scene.add(this.traffic.object);
     this.pedestrians = new PedestrianSystem(this.city, this.registry, this.quality, this.city.params.seed, this.trafficFocus());
     this.scene.add(this.pedestrians.object);
+    // Horn: nearby pedestrians flee, whether or not a vehicle is actually closing on them.
+    this.events.on('horn', ({ x, z }) => this.pedestrians.startle(x, z, HORN_RADIUS));
 
     this.cameraRig = new CameraRig(this.camera, this.grid);
     this.cameraRig.snapTo(this.cameraTarget());
@@ -133,16 +143,19 @@ export class Game {
 
   private spawnVehicles(): void {
     const spawn = this.city.spawn;
-    const first = new VehicleEntity(this.registry, { paint: CAR_COLOURS[0]! }, spawn.x, spawn.z, spawn.heading);
+    const firstType = pickVehicleType(this.vehicleRng);
+    const first = new VehicleEntity(this.registry, { type: firstType, paint: pickVehiclePaint(this.vehicleRng, firstType) }, spawn.x, spawn.z, spawn.heading);
     this.addVehicle(first);
-    // A few more parked cars along nearby roads so enter/exit and collisions are exercised.
+    // A few more parked cars, of random catalog types, along nearby roads so enter/exit and
+    // collisions are exercised and the different vehicle types are visible near the spawn point.
     const edges = this.city.roads.edges;
     let placed = 0;
     for (let i = 0; i < edges.length && placed < 7; i += 7) {
       const e = edges[i]!;
       const lp = lanePoint(this.city, e, 0.35 + (placed % 3) * 0.2, placed % 2 === 0, placed % 2);
       if (Math.hypot(lp.x - spawn.x, lp.z - spawn.z) < 12) continue;
-      const v = new VehicleEntity(this.registry, { paint: CAR_COLOURS[(placed + 1) % CAR_COLOURS.length]! }, lp.x, lp.z, lp.heading);
+      const type = pickVehicleType(this.vehicleRng);
+      const v = new VehicleEntity(this.registry, { type, paint: pickVehiclePaint(this.vehicleRng, type) }, lp.x, lp.z, lp.heading);
       this.addVehicle(v);
       placed++;
     }
@@ -151,6 +164,7 @@ export class Game {
   addVehicle(v: VehicleEntity): void {
     this.vehicles.push(v);
     this.trafficVehicles.push({ state: v.state, spec: v.spec });
+    v.setQuality(this.quality);
     this.scene.add(v.object);
   }
 
@@ -161,6 +175,7 @@ export class Game {
 
   applyQuality(q: QualitySettings): void {
     this.quality = q;
+    for (const v of this.vehicles) v.setQuality(q);
     this.camera.far = q.farDistance + 800;
     this.camera.updateProjectionMatrix();
     // World geometry depends on draw distance / prop density / texture sizes: rebuild it.
@@ -237,6 +252,7 @@ export class Game {
 
     if (this.mode === 'vehicle' && this.currentVehicle) {
       const v = this.currentVehicle;
+      if (inp.hornPressed) this.events.emit('horn', { x: v.state.x, z: v.state.z, heading: v.state.heading });
       v.step(dt, { throttle: inp.throttle, brake: inp.brake, steer: inp.steer, handbrake: inp.handbrake }, this.grid);
       for (const other of this.vehicles) {
         if (other === v) continue;
@@ -265,6 +281,9 @@ export class Game {
       if (v === this.currentVehicle) continue;
       Object.assign(v.prev, v.state);
       if (Math.hypot(v.state.vx, v.state.vz) > 0.01) v.step(dt, { throttle: 0, brake: 0.3, steer: 0, handbrake: true }, this.grid);
+      // Not physically stepped (fully at rest): still advance its cosmetic damage effects (paint
+      // scuff, dents, smoke, a police light bar) so they animate even while parked.
+      else v.updateEffects(dt);
     }
     // Every vehicle (parked, and the driven one if any) is a follow/yield obstacle and a physical
     // collision partner for the traffic AI.

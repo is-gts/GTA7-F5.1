@@ -50,6 +50,8 @@ export interface QualitySettings {
   maxPedestrians: number;
   /** Number of props (lamps/trees) drawn (0..1 fraction). */
   propDensity: number;
+  /** Damage-smoke particle emitter on badly damaged vehicles (cheap `Points`; off on low). */
+  damageSmoke: boolean;
 }
 
 export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
@@ -78,6 +80,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxTraffic: 12,
     maxPedestrians: 16,
     propDensity: 0.5,
+    damageSmoke: false,
   },
   medium: {
     preset: 'medium',
@@ -104,6 +107,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxTraffic: 24,
     maxPedestrians: 32,
     propDensity: 0.75,
+    damageSmoke: true,
   },
   high: {
     preset: 'high',
@@ -130,6 +134,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxTraffic: 40,
     maxPedestrians: 48,
     propDensity: 1,
+    damageSmoke: true,
   },
   ultra: {
     preset: 'ultra',
@@ -156,6 +161,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxTraffic: 60,
     maxPedestrians: 64,
     propDensity: 1,
+    damageSmoke: true,
   },
 };
 

@@ -31,6 +31,10 @@ describe('quality presets', () => {
     }
     expect(QUALITY_PRESETS.low.ao).toBe('none');
     expect(QUALITY_PRESETS.ultra.ao).toBe('gtao');
+    expect(QUALITY_PRESETS.low.damageSmoke).toBe(false);
+    expect(QUALITY_PRESETS.medium.damageSmoke).toBe(true);
+    expect(QUALITY_PRESETS.high.damageSmoke).toBe(true);
+    expect(QUALITY_PRESETS.ultra.damageSmoke).toBe(true);
   });
 
   it('getPreset returns a copy', () => {

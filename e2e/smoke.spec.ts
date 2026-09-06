@@ -8,7 +8,7 @@ interface Snapshot {
   renderer: { drawCalls: number; triangles: number; renderScale: number; width: number; height: number };
   shadows: string;
   player: { x: number; z: number; heading: number };
-  vehicle: { x: number; z: number; heading: number; speed: number; damage: number } | null;
+  vehicle: { x: number; z: number; heading: number; speed: number; damage: number; type: string } | null;
   vehicles: number;
   city: { buildings: number; chunks: number; instancedMeshes: number };
   frame: number;

@@ -574,6 +574,34 @@ export class PedestrianSystem {
     stepPedestrianPopulation(this.agents, this.graph, dt, { grid, vehicles: this.vehicleCache, onHit });
   }
 
+  /**
+   * Startle every pedestrian within `radius` of `(x, z)` into fleeing (e.g. the player leaning on
+   * the horn), regardless of whether a vehicle is actually closing on them. Agents already down,
+   * getting up or fleeing are left alone.
+   */
+  startle(x: number, z: number, radius: number): void {
+    const r2 = radius * radius;
+    for (const agent of this.agents) {
+      if (agent.mode !== 'walk' && agent.mode !== 'wait') continue;
+      const dx = agent.state.x - x;
+      const dz = agent.state.z - z;
+      if (dx * dx + dz * dz > r2) continue;
+      agent.mode = 'flee';
+      agent.timer = agent.rng.range(FLEE_MIN, FLEE_MAX);
+      // Aim for whichever end of the current edge is farther from the source, same as the
+      // proximity-triggered flee above.
+      const from = this.graph.nodes[agent.fromNode]!;
+      const to = this.graph.nodes[agent.toNode]!;
+      const dFrom = Math.hypot(from.x - x, from.z - z);
+      const dTo = Math.hypot(to.x - x, to.z - z);
+      if (dFrom > dTo) {
+        const tmp = agent.fromNode;
+        agent.fromNode = agent.toNode;
+        agent.toNode = tmp;
+      }
+    }
+  }
+
   /** Interpolate every active pooled pedestrian between its previous and current state. */
   syncVisual(alpha: number): void {
     const a = clamp01(alpha);

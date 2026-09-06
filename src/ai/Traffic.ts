@@ -29,6 +29,7 @@ import {
 } from '../physics/VehiclePhysics';
 import { Random } from '../world/Random';
 import { laneOffsetsShared, lanePoint, type CityData, type CityParams, type LanePoint, type RoadEdge } from '../world/CityGenerator';
+import { VEHICLE_TYPES, pickVehiclePaint, pickVehicleType, resolveVehicleSpec, type VehicleType } from '../entities/VehicleCatalog';
 
 // -----------------------------------------------------------------------------------------------
 // Pure agent logic
@@ -987,8 +988,6 @@ function buildSharedMaterials(registry: MaterialRegistry): SharedMaterials {
   };
 }
 
-const PAINT_PALETTE = [0xb23b3b, 0x2f6fae, 0xd8b23a, 0x2c2c34, 0xdedede, 0x3f8f4f, 0x7a4fae, 0xc97a2c, 0x556070, 0x8a4fd6];
-
 /** Keep spawns at least this far (m) from either end of an edge (i.e. out of the junctions). */
 const SPAWN_NODE_MARGIN = 16;
 /**
@@ -1001,6 +1000,7 @@ const STUCK_RECYCLE_DIST = 45;
 
 interface PoolSlot {
   group: Group;
+  mesh: Mesh;
   paint: MeshPhysicalMaterial;
   agent: TrafficAgent | null;
 }
@@ -1017,7 +1017,8 @@ export class TrafficSystem {
   private slots: PoolSlot[] = [];
   /** Active agents, kept in sync with `slots` on spawn/despawn (avoids rebuilding this every tick). */
   private agents: TrafficAgent[] = [];
-  private geometry: BufferGeometry | null = null;
+  /** One merged geometry per catalog type, sized to that type's spec (halfWidth/halfLength/wheelRadius/wheelBase). */
+  private geometries: Map<VehicleType, BufferGeometry> | null = null;
   private shared: SharedMaterials | null = null;
   private readonly rng: Random;
   private nextId = 1;
@@ -1053,7 +1054,9 @@ export class TrafficSystem {
   rebuild(quality: QualitySettings, focus: TrafficFocus): void {
     this.disposePool();
     this.spawnRadius = quality.drawDistance;
-    this.geometry = buildTrafficGeometry(DEFAULT_CAR_SPEC);
+    const geometries = new Map<VehicleType, BufferGeometry>();
+    for (const t of VEHICLE_TYPES) geometries.set(t, buildTrafficGeometry(resolveVehicleSpec(t)));
+    this.geometries = geometries;
     this.shared = buildSharedMaterials(this.registry);
     // Gated on the actual shadow mode (not the preset name) so a 'custom' preset derived from low
     // via q.* overrides doesn't accidentally cast shadows; 'single' (low's cheap shadow mode) skips
@@ -1071,14 +1074,15 @@ export class TrafficSystem {
   private createSlot(castShadow: boolean): PoolSlot {
     const paint = this.registry.register(new MeshPhysicalMaterial({ metalness: 0.6, roughness: 0.4, clearcoat: 0.5, clearcoatRoughness: 0.2 }));
     const shared = this.shared!;
-    const mesh = new Mesh(this.geometry!, [paint, shared.glass, shared.trim, shared.rubber, shared.headlight, shared.taillight]);
+    // Placeholder geometry (sedan); trySpawn() swaps it to the spawned agent's own type each time.
+    const mesh = new Mesh(this.geometries!.get('sedan')!, [paint, shared.glass, shared.trim, shared.rubber, shared.headlight, shared.taillight]);
     mesh.castShadow = castShadow;
     mesh.receiveShadow = true;
     const group = new Group();
     group.add(mesh);
     group.visible = false;
     this.object.add(group);
-    return { group, paint, agent: null };
+    return { group, mesh, paint, agent: null };
   }
 
   private trySpawn(focus: TrafficFocus): boolean {
@@ -1124,9 +1128,12 @@ export class TrafficSystem {
     if (!fallback) return false;
     const cruiseSpeed = this.rng.range(6, 12);
     const id = this.nextId++;
-    const agent = createTrafficAgent(id, this.city, fallback.path, this.rng.fork(`traffic-agent:${id}`), cruiseSpeed);
+    const type = pickVehicleType(this.rng);
+    const spec = resolveVehicleSpec(type);
+    const agent = createTrafficAgent(id, this.city, fallback.path, this.rng.fork(`traffic-agent:${id}`), cruiseSpeed, spec);
     free.agent = agent;
-    free.paint.color.set(this.rng.pick(PAINT_PALETTE));
+    free.mesh.geometry = this.geometries!.get(type)!;
+    free.paint.color.set(pickVehiclePaint(this.rng, type));
     free.group.visible = true;
     free.group.position.set(agent.state.x, 0, agent.state.z);
     free.group.rotation.set(0, agent.state.heading, 0);
@@ -1245,9 +1252,9 @@ export class TrafficSystem {
     }
     this.slots = [];
     this.agents = [];
-    if (this.geometry) {
-      this.geometry.dispose();
-      this.geometry = null;
+    if (this.geometries) {
+      for (const g of this.geometries.values()) g.dispose();
+      this.geometries = null;
     }
     if (this.shared) {
       for (const m of Object.values(this.shared)) {

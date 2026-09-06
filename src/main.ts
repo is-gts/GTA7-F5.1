@@ -77,7 +77,7 @@ const api = {
       renderer: game.gfx.stats(),
       shadows: game.lighting.shadowMode,
       player: { x: p.x, z: p.z, heading: p.heading },
-      vehicle: v ? { x: v.state.x, z: v.state.z, heading: v.state.heading, speed: v.state.forwardSpeed, damage: v.damage } : null,
+      vehicle: v ? { x: v.state.x, z: v.state.z, heading: v.state.heading, speed: v.state.forwardSpeed, damage: v.damage, type: v.type } : null,
       vehicles: game.vehicles.length,
       traffic: game.traffic.stats,
       pedestrians: game.pedestrians.stats,
