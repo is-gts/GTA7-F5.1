@@ -161,12 +161,28 @@ export function chunkKeyFor(p: CityParams, i: number, j: number): string {
   return `${ci},${cj}`;
 }
 
+const laneOffsetCache = new WeakMap<CityParams, readonly number[]>();
+
+/**
+ * Lane centre offsets from the road centreline for one direction of travel (metres), cached per
+ * `CityParams` object and **shared** — callers must not mutate the result. Use this from hot loops
+ * (the traffic AI queries lanes every fixed step for every agent); `laneOffsets` returns a copy.
+ */
+export function laneOffsetsShared(p: CityParams): readonly number[] {
+  let cached = laneOffsetCache.get(p);
+  if (!cached) {
+    const lanesPerDir = Math.max(1, Math.floor(p.roadWidth / 2 / p.laneWidth));
+    const out: number[] = [];
+    for (let l = 0; l < lanesPerDir; l++) out.push(p.laneWidth * (l + 0.5));
+    cached = out;
+    laneOffsetCache.set(p, cached);
+  }
+  return cached;
+}
+
 /** Lane centre offsets from the road centreline for one direction of travel (metres). */
 export function laneOffsets(p: CityParams): number[] {
-  const lanesPerDir = Math.max(1, Math.floor(p.roadWidth / 2 / p.laneWidth));
-  const out: number[] = [];
-  for (let l = 0; l < lanesPerDir; l++) out.push(p.laneWidth * (l + 0.5));
-  return out;
+  return laneOffsetsShared(p).slice();
 }
 
 export function generateCity(partial: Partial<CityParams> = {}): CityData {
@@ -353,10 +369,18 @@ export function generateCity(partial: Partial<CityParams> = {}): CityData {
   };
 }
 
+/** Position + heading of a point on a lane centreline. */
+export interface LanePoint {
+  x: number;
+  z: number;
+  heading: number;
+}
+
 /**
  * Position along an edge for a direction of travel. `t` in [0,1] runs from node `a` to `b` when
  * `forward` is true, otherwise from `b` to `a`. `laneIndex` picks the lane (0 = innermost).
  * Right-hand traffic: the lane offset is applied to the right of the direction of travel.
+ * Pass `out` to write into an existing object instead of allocating one (hot loops).
  */
 export function lanePoint(
   city: CityData,
@@ -364,7 +388,8 @@ export function lanePoint(
   t: number,
   forward: boolean,
   laneIndex = 0,
-): { x: number; z: number; heading: number } {
+  out?: LanePoint,
+): LanePoint {
   const na = city.roads.nodes[edge.a]!;
   const nb = city.roads.nodes[edge.b]!;
   const from = forward ? na : nb;
@@ -376,13 +401,13 @@ export function lanePoint(
   const fz = dz / len;
   const heading = Math.atan2(fx, fz);
   // right vector = forward x up = (-cos h, sin h) = (-fz, fx)
-  const offsets = laneOffsets(city.params);
+  const offsets = laneOffsetsShared(city.params);
   const off = offsets[Math.min(laneIndex, offsets.length - 1)]!;
-  return {
-    x: from.x + dx * t - fz * off,
-    z: from.z + dz * t + fx * off,
-    heading,
-  };
+  const result = out ?? { x: 0, z: 0, heading: 0 };
+  result.x = from.x + dx * t - fz * off;
+  result.z = from.z + dz * t + fx * off;
+  result.heading = heading;
+  return result;
 }
 
 /** Axis-aligned collision boxes for every building (for the static physics grid). */

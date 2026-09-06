@@ -2,6 +2,7 @@
  * Top-level game composition: world, entities, rendering, input and the simulation loop.
  */
 import { Color, MathUtils, PerspectiveCamera, Scene, Vector3 } from 'three';
+import { TrafficSystem } from '../ai/Traffic';
 import { Engine } from '../core/Engine';
 import { Input } from '../core/Input';
 import { detectQualityPreset, getPreset, isPresetName, saveQuality, type QualityPresetName, type QualitySettings } from '../core/Quality';
@@ -9,7 +10,7 @@ import { CameraRig } from '../entities/CameraRig';
 import { PlayerEntity } from '../entities/PlayerEntity';
 import { VehicleEntity } from '../entities/VehicleEntity';
 import { StaticColliderGrid, type OBB } from '../physics/Collision';
-import { resolveVehicleVehicle } from '../physics/VehiclePhysics';
+import { resolveVehicleVehicle, type VehicleSpec, type VehicleState } from '../physics/VehiclePhysics';
 import { GameRenderer } from '../render/GameRenderer';
 import { Lighting } from '../render/Lighting';
 import { MaterialRegistry } from '../render/MaterialRegistry';
@@ -50,6 +51,13 @@ export class Game {
   readonly hud: HUD;
   readonly player: PlayerEntity;
   readonly vehicles: VehicleEntity[] = [];
+  /**
+   * Persistent, index-aligned {state,spec} view of `vehicles` for the traffic AI (follow/yield
+   * obstacles + physical resolution) — includes the driven car when in a vehicle. Built once
+   * (vehicles never change after construction) so `update()` needs no per-tick allocation here.
+   */
+  private readonly trafficVehicles: { state: VehicleState; spec: VehicleSpec }[] = [];
+  readonly traffic: TrafficSystem;
   readonly cameraRig: CameraRig;
   cityView: CityView;
   quality: QualitySettings;
@@ -91,6 +99,8 @@ export class Game {
     this.player = new PlayerEntity(this.registry, spawn.x - 1.0, spawn.z + 3.2, spawn.heading);
     this.scene.add(this.player.object);
     this.spawnVehicles();
+    this.traffic = new TrafficSystem(this.city, this.registry, this.quality, this.city.params.seed, this.trafficFocus());
+    this.scene.add(this.traffic.object);
 
     this.cameraRig = new CameraRig(this.camera, this.grid);
     this.cameraRig.snapTo(this.cameraTarget());
@@ -120,6 +130,7 @@ export class Game {
 
   addVehicle(v: VehicleEntity): void {
     this.vehicles.push(v);
+    this.trafficVehicles.push({ state: v.state, spec: v.spec });
     this.scene.add(v.object);
   }
 
@@ -140,6 +151,7 @@ export class Game {
     this.lighting.rebuild(q);
     this.lighting.onCameraChanged();
     this.gfx.applyQuality(q, this.scene, this.camera, this.dpr);
+    this.traffic.rebuild(q, this.trafficFocus());
     this.setTimeOfDay(this.timeOfDay, true);
     saveQuality(this.storage, q);
     this.hud.showToast(`Quality: ${q.preset}`);
@@ -178,6 +190,7 @@ export class Game {
     );
     this.cityView.setNightFactor(night);
     for (const v of this.vehicles) v.setLights(night > 0.5);
+    this.traffic.setLights(night > 0.5);
     this.scene.environmentIntensity = 0.25 + 0.75 * daylight;
     if (this.quality.envReflections) {
       if (forceEnv || Math.abs(this.timeOfDay - this.lastEnvTime) > 0.25) {
@@ -223,11 +236,28 @@ export class Game {
       }
       this.player.step(dt, { dirX, dirZ, run: inp.sprint }, this.grid, obbs);
     }
-    // Let parked vehicles settle (they are static unless bumped).
+    // Let parked vehicles settle (they are static unless bumped). Sync `prev` unconditionally
+    // (even when not stepped) so a later traffic-AI collision push this same tick still
+    // interpolates smoothly from "start of frame" instead of popping (v.step() already does this
+    // for itself when it runs; this covers the vehicles it skips).
     for (const v of this.vehicles) {
       if (v === this.currentVehicle) continue;
+      Object.assign(v.prev, v.state);
       if (Math.hypot(v.state.vx, v.state.vz) > 0.01) v.step(dt, { throttle: 0, brake: 0.3, steer: 0, handbrake: true }, this.grid);
     }
+    // Every vehicle (parked, and the driven one if any) is a follow/yield obstacle and a physical
+    // collision partner for the traffic AI.
+    this.traffic.update(dt, this.trafficFocus(), this.grid, this.trafficVehicles);
+  }
+
+  /** Point the traffic system uses to decide what to spawn/despawn around (player or their car). */
+  private trafficFocus(): { x: number; z: number; heading: number } {
+    if (this.mode === 'vehicle' && this.currentVehicle) {
+      const v = this.currentVehicle.state;
+      return { x: v.x, z: v.z, heading: v.heading };
+    }
+    const p = this.player.state;
+    return { x: p.x, z: p.z, heading: p.heading };
   }
 
   private toggleVehicle(): void {
@@ -281,6 +311,7 @@ export class Game {
   // --- rendering ----------------------------------------------------------------
   private render(alpha: number, frameDelta: number): void {
     for (const v of this.vehicles) v.syncVisual(alpha);
+    this.traffic.syncVisual(alpha);
     this.player.syncVisual(alpha);
     const target = this.cameraTarget();
     const s = this.input.state;
@@ -348,6 +379,7 @@ export class Game {
   dispose(): void {
     this.stop();
     for (const v of this.vehicles) v.dispose(this.registry);
+    this.traffic.dispose();
     this.player.dispose(this.registry);
     this.cityView.dispose();
     this.lighting.dispose();

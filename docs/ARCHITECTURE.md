@@ -11,6 +11,8 @@ src/
   physics/   Collision (2D AABB/OBB/circle SAT + spatial hash), VehiclePhysics (arcade car model),
              CharacterController (on-foot movement)
   entities/  VehicleEntity, PlayerEntity (mesh + state + interpolation), CameraRig (chase camera)
+  ai/        Traffic (lane following on the road graph, intersection fillets, follow/yield rules,
+             pooled AI cars driven by the same vehicle physics as the player)
   game/      Game (composition root: update/render systems, enter/exit vehicle, time of day, quality)
   ui/        HUD (DOM overlay)
   main.ts    bootstrap, URL parameters, window.__gta7 debug/automation API
