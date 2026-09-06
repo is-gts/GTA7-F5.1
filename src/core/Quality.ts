@@ -48,6 +48,9 @@ export interface QualitySettings {
   /** Density limits for dynamic agents. */
   maxTraffic: number;
   maxPedestrians: number;
+  /** Cap on simultaneously pursuing police cars (`Wanted.policeCountForLevel`) — full-detail
+   *  `VehicleEntity`s with a light bar, so the weakest devices carry fewer of them. */
+  maxPolice: number;
   /** Number of props (lamps/trees) drawn (0..1 fraction). */
   propDensity: number;
   /** Damage-smoke particle emitter on badly damaged vehicles (cheap `Points`; off on low). */
@@ -79,6 +82,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     envReflections: false,
     maxTraffic: 12,
     maxPedestrians: 16,
+    maxPolice: 3,
     propDensity: 0.5,
     damageSmoke: false,
   },
@@ -106,6 +110,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     envReflections: true,
     maxTraffic: 24,
     maxPedestrians: 32,
+    maxPolice: 4,
     propDensity: 0.75,
     damageSmoke: true,
   },
@@ -133,6 +138,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     envReflections: true,
     maxTraffic: 40,
     maxPedestrians: 48,
+    maxPolice: 5,
     propDensity: 1,
     damageSmoke: true,
   },
@@ -160,6 +166,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     envReflections: true,
     maxTraffic: 60,
     maxPedestrians: 64,
+    maxPolice: 5,
     propDensity: 1,
     damageSmoke: true,
   },

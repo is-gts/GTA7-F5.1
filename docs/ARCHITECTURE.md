@@ -12,9 +12,13 @@ src/
              CharacterController (on-foot movement)
   entities/  VehicleEntity, PlayerEntity (mesh + state + interpolation), CameraRig (chase camera)
   ai/        Traffic (lane following on the road graph, intersection fillets, follow/yield rules,
-             pooled AI cars driven by the same vehicle physics as the player)
-  game/      Game (composition root: update/render systems, enter/exit vehicle, time of day, quality)
-  ui/        HUD (DOM overlay)
+             pooled AI cars driven by the same vehicle physics as the player),
+             Pedestrians (sidewalk crowds, crossings, knockdowns),
+             Police (pursuit: the traffic lane follower with a route directed at the player, plus a
+             direct ram/arrest approach once the target is close and in the clear)
+  game/      Game (composition root: update/render systems, enter/exit vehicle, time of day, quality),
+             Wanted (pure heat/level state machine behind police spawns and the busted rule)
+  ui/        HUD (DOM overlay), Minimap (cached road layer + throttled dynamic dots)
   main.ts    bootstrap, URL parameters, window.__gta7 debug/automation API
 tests/       vitest unit tests (pure modules only — no WebGL)
 e2e/         Playwright smoke tests against the production build (headless SwiftShader)

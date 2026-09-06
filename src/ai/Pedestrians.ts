@@ -441,6 +441,8 @@ export class PedestrianSystem {
   readonly object = new Group();
   private slots: PedSlot[] = [];
   private agents: PedestrianAgent[] = [];
+  /** Persistent buffer behind `positions` (no per-call allocation for the minimap). */
+  private readonly positionView: { x: number; z: number }[] = [];
   private geometry: BufferGeometry | null = null;
   private skinMat: MeshStandardMaterial | null = null;
   private pantsMat: MeshStandardMaterial | null = null;
@@ -620,6 +622,20 @@ export class PedestrianSystem {
       slot.figure.rotation.x = tilt;
       slot.figure.position.y = down ? 0.35 : 0;
     }
+  }
+
+  /** World position of every active pedestrian (e.g. for the minimap's dynamic dot layer),
+   *  refreshed in place in a persistent buffer rather than allocating one per call. */
+  get positions(): readonly { x: number; z: number }[] {
+    while (this.positionView.length < this.agents.length) this.positionView.push({ x: 0, z: 0 });
+    this.positionView.length = this.agents.length;
+    for (let i = 0; i < this.agents.length; i++) {
+      const a = this.agents[i]!;
+      const p = this.positionView[i]!;
+      p.x = a.state.x;
+      p.z = a.state.z;
+    }
+    return this.positionView;
   }
 
   /** Snapshot for debugging / e2e assertions. */

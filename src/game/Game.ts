@@ -4,6 +4,7 @@
 import { Color, MathUtils, PerspectiveCamera, Scene, Vector3 } from 'three';
 import { obstacleFromVehicle, TrafficSystem, type TrafficObstacle } from '../ai/Traffic';
 import { PedestrianSystem } from '../ai/Pedestrians';
+import { PoliceSystem, RAM_STOP_GAP, type PoliceFocus } from '../ai/Police';
 import { Engine } from '../core/Engine';
 import { EventBus } from '../core/EventBus';
 import { Input } from '../core/Input';
@@ -12,6 +13,7 @@ import { CameraRig } from '../entities/CameraRig';
 import { PlayerEntity } from '../entities/PlayerEntity';
 import { VehicleEntity } from '../entities/VehicleEntity';
 import { pickVehiclePaint, pickVehicleType } from '../entities/VehicleCatalog';
+import { DEFAULT_CHARACTER_SPEC } from '../physics/CharacterController';
 import { StaticColliderGrid, type OBB } from '../physics/Collision';
 import { resolveVehicleVehicle, type VehicleSpec, type VehicleState } from '../physics/VehiclePhysics';
 import { GameRenderer } from '../render/GameRenderer';
@@ -19,9 +21,11 @@ import { Lighting } from '../render/Lighting';
 import { MaterialRegistry } from '../render/MaterialRegistry';
 import { SkyDome } from '../render/SkyDome';
 import { HUD } from '../ui/HUD';
+import { Minimap } from '../ui/Minimap';
 import { Random } from '../world/Random';
 import { buildCity, type CityView } from '../world/CityBuilder';
 import { buildingAABBs, generateCity, lanePoint, type CityData, type CityParams } from '../world/CityGenerator';
+import { addWantedHeat, createWantedState, policeCountForLevel, stepWanted, POLICE_CONTACT_RANGE, type WantedState } from './Wanted';
 
 export interface GameOptions {
   canvas: HTMLCanvasElement;
@@ -42,9 +46,30 @@ export const ENTER_VEHICLE_RADIUS = 5.5;
 /** Radius (m) around a honking vehicle within which pedestrians are startled into fleeing. */
 const HORN_RADIUS = 18;
 
+/** Collision impulse (m/s of closing speed removed) above which a vehicle-vehicle hit counts as a
+ *  reckless "crash" for the wanted system. */
+const CRASH_IMPULSE_THRESHOLD = 4;
+
+/** Player (or their car) must be slower than this and within `BUSTED_RANGE_GAP` (a body-to-body
+ *  gap, not centre-to-centre — a cop parked nose-to-tail against the player is ~4.5 m of centre
+ *  distance but 0 m of actual gap) of a police car for `BUSTED_HOLD_TIME` continuous seconds. */
+const BUSTED_SPEED = 1;
+const BUSTED_RANGE_GAP = RAM_STOP_GAP + 0.6;
+/** Once the hold has started, it survives out to this gap (m): two cars resting against each other
+ *  jostle by a few centimetres as the collision solver settles, and a hard reset on the first such
+ *  wobble would mean the 3 s hold could never complete. */
+const BUSTED_RELEASE_GAP = BUSTED_RANGE_GAP + 1.2;
+const BUSTED_HOLD_TIME = 3;
+/** How long the "BUSTED" overlay stays up before the player regains control. */
+const BUSTED_OVERLAY_TIME = 2.5;
+
 export interface GameEvents {
   /** A pedestrian was struck by a vehicle moving faster than the knockdown threshold. */
   pedestrianHit: { speed: number };
+  /** The player's vehicle crashed into another (parked or AI-driven) car hard enough to matter. */
+  vehicleCrash: { impulse: number };
+  /** The player's vehicle rammed (or was rammed by) a pursuing police car. */
+  policeContact: { impulse: number };
   /** The player leaned on the horn (H) while driving. */
   horn: { x: number; z: number; heading: number };
   [key: string]: unknown;
@@ -72,15 +97,52 @@ export class Game {
    * (vehicles never change after construction) so `update()` needs no per-tick allocation here.
    */
   private readonly trafficVehicles: { state: VehicleState; spec: VehicleSpec }[] = [];
+  /**
+   * `trafficVehicles` plus the currently active police cars, rebuilt (references only, no new
+   * per-car objects) each tick — so traffic yields to/pushes pursuing police the same way it does
+   * every other vehicle, instead of driving straight through them.
+   */
+  private readonly trafficVehiclesAndPolice: { state: VehicleState; spec: VehicleSpec }[] = [];
   readonly traffic: TrafficSystem;
   readonly pedestrians: PedestrianSystem;
+  readonly police: PoliceSystem;
+  readonly minimap: Minimap;
+  wanted: WantedState = createWantedState();
+  /** Whether at least one police car currently exists and is chasing the player. */
+  policePursuing = false;
+  /** True while the "BUSTED" overlay is showing (just after being caught by police). */
+  busted = false;
+  private bustedContactTimer = 0;
+  private bustedOverlayTimer = 0;
   /**
    * Persistent, index-aligned `TrafficObstacle` view of `vehicles` for the pedestrian AI (danger /
    * knockdown checks) — refreshed in place each tick, built once since `vehicles` doesn't change.
    */
   private readonly pedestrianVehicleView: TrafficObstacle[] = [];
-  /** Combined (vehicles + traffic agents) obstacle scratch buffer, rebuilt in place each tick. */
+  /**
+   * Persistent, index-aligned `TrafficObstacle` view of the active police cars (so pursuing cops
+   * can also knock pedestrians down / be yielded to, not just parked/traffic vehicles) — resized and
+   * refreshed in place each tick.
+   */
+  private readonly policeObstacleView: TrafficObstacle[] = [];
+  /** Combined (vehicles + police + traffic agents) obstacle scratch buffer, rebuilt in place each tick. */
   private readonly pedestrianObstacles: TrafficObstacle[] = [];
+  /**
+   * What the police road-following controller follows/yields to: every vehicle plus the traffic
+   * agents (but not the police cars themselves — `PoliceSystem` adds those per car, minus self).
+   * Rebuilt in place each tick from the same persistent views.
+   */
+  private readonly policeObstacles: TrafficObstacle[] = [];
+  /** Persistent pursuit target + bound callbacks (no per-tick allocation in the police hot path). */
+  private readonly policeFocus: PoliceFocus = { x: 0, z: 0, heading: 0, vx: 0, vz: 0, halfLength: 0 };
+  private readonly onPoliceRam = (impulse: number): void => this.events.emit('policeContact', { impulse });
+  private readonly onTrafficImpact = (impulse: number, vehicleIndex: number): void => {
+    if (impulse > CRASH_IMPULSE_THRESHOLD && this.vehicles[vehicleIndex] === this.currentVehicle) {
+      this.events.emit('vehicleCrash', { impulse });
+    }
+  };
+  /** Reused police-dot buffer for the minimap (redrawn at 10 Hz, but still no need to allocate). */
+  private readonly policeDots: { x: number; z: number }[] = [];
   readonly cameraRig: CameraRig;
   cityView: CityView;
   quality: QualitySettings;
@@ -89,7 +151,9 @@ export class Game {
   paused = false;
   private timeOfDay = 14;
   private lastEnvTime = -1;
-  private hudAccum = 0;
+  // Start at the refresh threshold so the very first rendered frame fills the HUD in (speed, stars,
+  // perf line) instead of showing the constructor's placeholders for the first quarter second.
+  private hudAccum = 1;
   private readonly focus = new Vector3();
   private readonly storage: Storage | null;
   private readonly dpr: number;
@@ -131,6 +195,13 @@ export class Game {
     this.scene.add(this.pedestrians.object);
     // Horn: nearby pedestrians flee, whether or not a vehicle is actually closing on them.
     this.events.on('horn', ({ x, z }) => this.pedestrians.startle(x, z, HORN_RADIUS));
+
+    this.police = new PoliceSystem(this.registry, this.city.params.seed);
+    this.minimap = new Minimap(opts.hudContainer, this.city);
+    // Wanted heat: every event kind just feeds the same pure state machine (see Wanted.ts).
+    this.events.on('pedestrianHit', () => (this.wanted = addWantedHeat(this.wanted, 'pedestrianHit')));
+    this.events.on('vehicleCrash', () => (this.wanted = addWantedHeat(this.wanted, 'vehicleCrash')));
+    this.events.on('policeContact', () => (this.wanted = addWantedHeat(this.wanted, 'policeContact')));
 
     this.cameraRig = new CameraRig(this.camera, this.grid);
     this.cameraRig.snapTo(this.cameraTarget());
@@ -176,6 +247,7 @@ export class Game {
   applyQuality(q: QualitySettings): void {
     this.quality = q;
     for (const v of this.vehicles) v.setQuality(q);
+    this.police.setQuality(q);
     this.camera.far = q.farDistance + 800;
     this.camera.updateProjectionMatrix();
     // World geometry depends on draw distance / prop density / texture sizes: rebuild it.
@@ -227,6 +299,7 @@ export class Game {
     this.cityView.setNightFactor(night);
     for (const v of this.vehicles) v.setLights(night > 0.5);
     this.traffic.setLights(night > 0.5);
+    this.police.setLights(night > 0.5);
     this.scene.environmentIntensity = 0.25 + 0.75 * daylight;
     if (this.quality.envReflections) {
       if (forceEnv || Math.abs(this.timeOfDay - this.lastEnvTime) > 0.25) {
@@ -248,30 +321,41 @@ export class Game {
       if (name && isPresetName(name) && name !== this.quality.preset) this.setQualityPreset(name);
     }
     if (this.paused) return;
-    if (inp.interactPressed) this.toggleVehicle();
 
-    if (this.mode === 'vehicle' && this.currentVehicle) {
-      const v = this.currentVehicle;
-      if (inp.hornPressed) this.events.emit('horn', { x: v.state.x, z: v.state.z, heading: v.state.heading });
-      v.step(dt, { throttle: inp.throttle, brake: inp.brake, steer: inp.steer, handbrake: inp.handbrake }, this.grid);
-      for (const other of this.vehicles) {
-        if (other === v) continue;
-        if (Math.hypot(other.state.x - v.state.x, other.state.z - v.state.z) > 12) continue;
-        Object.assign(other.prev, other.state);
-        resolveVehicleVehicle(v.state, v.spec, other.state, other.spec);
+    // While the "BUSTED" overlay is up, the player (on foot or in a car) is frozen — no movement
+    // input is processed — so the fade genuinely reads as "caught", not "still driving with a red
+    // overlay on screen". The world around them (traffic, pedestrians, parked-vehicle settling, and
+    // `updatePolice` itself, which ticks the overlay countdown) keeps going.
+    if (!this.busted) {
+      if (inp.interactPressed) this.toggleVehicle();
+
+      if (this.mode === 'vehicle' && this.currentVehicle) {
+        const v = this.currentVehicle;
+        if (inp.hornPressed) this.events.emit('horn', { x: v.state.x, z: v.state.z, heading: v.state.heading });
+        v.step(dt, { throttle: inp.throttle, brake: inp.brake, steer: inp.steer, handbrake: inp.handbrake }, this.grid);
+        for (const other of this.vehicles) {
+          if (other === v) continue;
+          if (Math.hypot(other.state.x - v.state.x, other.state.z - v.state.z) > 12) continue;
+          Object.assign(other.prev, other.state);
+          const impact = resolveVehicleVehicle(v.state, v.spec, other.state, other.spec);
+          if (impact && impact.impulse > CRASH_IMPULSE_THRESHOLD) this.events.emit('vehicleCrash', { impulse: impact.impulse });
+        }
+      } else {
+        // Camera-relative movement: forward = (sin yaw, cos yaw), right = (-cos yaw, sin yaw).
+        const yaw = this.cameraRig.yaw + this.cameraRig.orbitYaw;
+        const fx = Math.sin(yaw), fz = Math.cos(yaw);
+        const rx = -Math.cos(yaw), rz = Math.sin(yaw);
+        const dirX = fx * inp.moveY + rx * inp.moveX;
+        const dirZ = fz * inp.moveY + rz * inp.moveX;
+        const obbs: OBB[] = [];
+        for (const v of this.vehicles) {
+          if (Math.hypot(v.state.x - this.player.state.x, v.state.z - this.player.state.z) < 8) obbs.push(v.obb);
+        }
+        for (const c of this.police.cars) {
+          if (Math.hypot(c.state.x - this.player.state.x, c.state.z - this.player.state.z) < 8) obbs.push(c.obb);
+        }
+        this.player.step(dt, { dirX, dirZ, run: inp.sprint }, this.grid, obbs);
       }
-    } else {
-      // Camera-relative movement: forward = (sin yaw, cos yaw), right = (-cos yaw, sin yaw).
-      const yaw = this.cameraRig.yaw + this.cameraRig.orbitYaw;
-      const fx = Math.sin(yaw), fz = Math.cos(yaw);
-      const rx = -Math.cos(yaw), rz = Math.sin(yaw);
-      const dirX = fx * inp.moveY + rx * inp.moveX;
-      const dirZ = fz * inp.moveY + rz * inp.moveX;
-      const obbs: OBB[] = [];
-      for (const v of this.vehicles) {
-        if (Math.hypot(v.state.x - this.player.state.x, v.state.z - this.player.state.z) < 8) obbs.push(v.obb);
-      }
-      this.player.step(dt, { dirX, dirZ, run: inp.sprint }, this.grid, obbs);
     }
     // Let parked vehicles settle (they are static unless bumped). Sync `prev` unconditionally
     // (even when not stepped) so a later traffic-AI collision push this same tick still
@@ -285,36 +369,157 @@ export class Game {
       // scuff, dents, smoke, a police light bar) so they animate even while parked.
       else v.updateEffects(dt);
     }
-    // Every vehicle (parked, and the driven one if any) is a follow/yield obstacle and a physical
-    // collision partner for the traffic AI.
-    this.traffic.update(dt, this.trafficFocus(), this.grid, this.trafficVehicles);
+    // Every vehicle (parked, the driven one if any, and pursuing police) is a follow/yield obstacle
+    // and a physical collision partner for the traffic AI — so traffic actually avoids/gets pushed
+    // by a police car instead of driving straight through it. A hard hit on the player's own car
+    // (whichever index that is in `trafficVehicles`, always at the front of the combined array) still
+    // counts as a reckless crash for the wanted system; a hit on a police car does not.
+    this.trafficVehiclesAndPolice.length = this.trafficVehicles.length + this.police.cars.length;
+    let tvi = 0;
+    for (const v of this.trafficVehicles) this.trafficVehiclesAndPolice[tvi++] = v;
+    for (const c of this.police.cars) this.trafficVehiclesAndPolice[tvi++] = c;
+    this.traffic.update(dt, this.trafficFocus(), this.grid, this.trafficVehiclesAndPolice, this.onTrafficImpact);
     this.pedestrians.update(dt, this.trafficFocus(), this.grid, this.refreshPedestrianObstacles(), (speed) => this.events.emit('pedestrianHit', { speed }));
+    this.updatePolice(dt);
+  }
+
+  /** Wanted decay/level, police spawn/despawn + pursuit, and the busted state machine. */
+  private updatePolice(dt: number): void {
+    const focus = this.trafficFocus();
+    // Spawn/despawn for the *current* level (any event this tick already bumped `this.wanted` via
+    // the listeners above) before checking contact, so a freshly-raised wanted level gets its
+    // police car in the same tick — otherwise the very first decay step (there being no police car
+    // yet to be "in contact") could erase the heat before one ever gets the chance to spawn.
+    const desired = policeCountForLevel(this.wanted.level, this.quality.maxPolice);
+    this.police.sync(desired, this.city, focus, this.scene);
+    const nearestPolice = this.police.nearestDistance(focus.x, focus.z);
+    // The response is still being dispatched (the pool spawns one car per tick) — hold the
+    // "they lose you" clock at zero until it is complete, so a level can never time out before the
+    // cars it called for have even appeared.
+    const deploying = this.police.count < desired;
+    this.wanted = stepWanted(this.wanted, dt, deploying || nearestPolice <= POLICE_CONTACT_RANGE);
+
+    const targetVel = this.mode === 'vehicle' && this.currentVehicle ? this.currentVehicle.state : this.player.state;
+    const playerVehicle = this.mode === 'vehicle' && this.currentVehicle ? this.currentVehicle : null;
+    const playerHalfLength = this.mode === 'vehicle' && this.currentVehicle ? this.currentVehicle.spec.halfLength : DEFAULT_CHARACTER_SPEC.radius;
+    const pf = this.policeFocus;
+    pf.x = focus.x;
+    pf.z = focus.z;
+    pf.heading = focus.heading;
+    pf.vx = targetVel.vx;
+    pf.vz = targetVel.vz;
+    pf.halfLength = playerHalfLength;
+    this.policePursuing = this.police.update(
+      dt,
+      pf,
+      this.city,
+      this.grid,
+      this.trafficVehicles,
+      playerVehicle,
+      this.refreshPoliceObstacles(),
+      this.onPoliceRam,
+    );
+
+    if (this.busted) {
+      this.bustedOverlayTimer -= dt;
+      if (this.bustedOverlayTimer <= 0) this.busted = false;
+      return;
+    }
+    const speed = Math.hypot(targetVel.vx, targetVel.vz);
+    const nearestPoliceGap = this.police.nearestGap(focus.x, focus.z, playerHalfLength);
+    const holding = this.bustedContactTimer > 0;
+    const gapLimit = holding ? BUSTED_RELEASE_GAP : BUSTED_RANGE_GAP;
+    if (this.wanted.level >= 1 && speed < BUSTED_SPEED && nearestPoliceGap < gapLimit) {
+      this.bustedContactTimer += dt;
+      if (this.bustedContactTimer >= BUSTED_HOLD_TIME) this.triggerBusted();
+    } else {
+      this.bustedContactTimer = 0;
+    }
   }
 
   /**
-   * Combined (parked/player vehicles + traffic agents) obstacle view for the pedestrian AI's danger
-   * and knockdown checks, rebuilt in place each tick (both source arrays are themselves persistent
-   * and index-aligned, so this is index copies, not object allocation, beyond an occasional resize
-   * of the buffer itself).
+   * Refresh the persistent, index-aligned `TrafficObstacle` view of `vehicles` (parked cars and the
+   * player's own) in place — built once, since `vehicles` never changes after construction. Marked
+   * `parked`, so an AI car that finds one blocking its lane drives around it instead of queueing
+   * behind it for ever.
    */
-  private refreshPedestrianObstacles(): readonly TrafficObstacle[] {
+  private refreshVehicleView(): void {
     if (this.pedestrianVehicleView.length !== this.vehicles.length) {
       this.pedestrianVehicleView.length = 0;
-      for (const v of this.vehicles) this.pedestrianVehicleView.push(obstacleFromVehicle(v.state, v.spec));
+      for (const v of this.vehicles) this.pedestrianVehicleView.push(obstacleFromVehicle(v.state, v.spec, true));
+      return;
+    }
+    for (let i = 0; i < this.vehicles.length; i++) {
+      const v = this.vehicles[i]!;
+      const ob = this.pedestrianVehicleView[i]!;
+      ob.x = v.state.x;
+      ob.z = v.state.z;
+      ob.heading = v.state.heading;
+      ob.forwardSpeed = v.state.forwardSpeed;
+    }
+  }
+
+  /**
+   * The obstacle view the police road-following controller uses: every vehicle plus the traffic
+   * agents. Police cars are deliberately excluded — `PoliceSystem` appends the other police cars per
+   * car so none of them sees itself as an obstacle.
+   */
+  private refreshPoliceObstacles(): readonly TrafficObstacle[] {
+    this.refreshVehicleView();
+    const trafficObstacles = this.traffic.obstacles;
+    this.policeObstacles.length = this.pedestrianVehicleView.length + trafficObstacles.length;
+    let n = 0;
+    for (const ob of this.pedestrianVehicleView) this.policeObstacles[n++] = ob;
+    for (const ob of trafficObstacles) this.policeObstacles[n++] = ob;
+    return this.policeObstacles;
+  }
+
+  /** Caught by police: freeze the chase, respawn on foot at the city spawn, reset the wanted level. */
+  private triggerBusted(): void {
+    this.busted = true;
+    this.bustedOverlayTimer = BUSTED_OVERLAY_TIME;
+    this.bustedContactTimer = 0;
+    if (this.mode === 'vehicle' && this.currentVehicle) {
+      this.currentVehicle.driven = false;
+      this.currentVehicle = null;
+      this.mode = 'foot';
+    }
+    const spawn = this.city.spawn;
+    this.player.teleport(spawn.x - 1.0, spawn.z + 3.2, spawn.heading);
+    this.player.object.visible = true;
+    this.wanted = createWantedState();
+    this.police.dispose(this.scene);
+    this.policePursuing = false;
+    this.updateHint();
+  }
+
+  /**
+   * Combined (parked/player vehicles + police + traffic agents) obstacle view for the pedestrian
+   * AI's danger and knockdown checks, rebuilt in place each tick (source arrays are themselves
+   * persistent and index-aligned, so this is index copies, not object allocation, beyond an
+   * occasional resize of the buffers themselves).
+   */
+  private refreshPedestrianObstacles(): readonly TrafficObstacle[] {
+    this.refreshVehicleView();
+    const policeCars = this.police.cars;
+    if (this.policeObstacleView.length !== policeCars.length) {
+      this.policeObstacleView.length = 0;
+      for (const c of policeCars) this.policeObstacleView.push(obstacleFromVehicle(c.state, c.spec));
     } else {
-      for (let i = 0; i < this.vehicles.length; i++) {
-        const v = this.vehicles[i]!;
-        const ob = this.pedestrianVehicleView[i]!;
-        ob.x = v.state.x;
-        ob.z = v.state.z;
-        ob.heading = v.state.heading;
-        ob.forwardSpeed = v.state.forwardSpeed;
+      for (let i = 0; i < policeCars.length; i++) {
+        const c = policeCars[i]!;
+        const ob = this.policeObstacleView[i]!;
+        ob.x = c.state.x;
+        ob.z = c.state.z;
+        ob.heading = c.state.heading;
+        ob.forwardSpeed = c.state.forwardSpeed;
       }
     }
     const trafficObstacles = this.traffic.obstacles;
-    this.pedestrianObstacles.length = this.pedestrianVehicleView.length + trafficObstacles.length;
+    this.pedestrianObstacles.length = this.pedestrianVehicleView.length + this.policeObstacleView.length + trafficObstacles.length;
     let n = 0;
     for (const ob of this.pedestrianVehicleView) this.pedestrianObstacles[n++] = ob;
+    for (const ob of this.policeObstacleView) this.pedestrianObstacles[n++] = ob;
     for (const ob of trafficObstacles) this.pedestrianObstacles[n++] = ob;
     return this.pedestrianObstacles;
   }
@@ -380,6 +585,7 @@ export class Game {
   // --- rendering ----------------------------------------------------------------
   private render(alpha: number, frameDelta: number): void {
     for (const v of this.vehicles) v.syncVisual(alpha);
+    this.police.syncVisual(alpha);
     this.traffic.syncVisual(alpha);
     this.pedestrians.syncVisual(alpha);
     this.player.syncVisual(alpha);
@@ -391,11 +597,35 @@ export class Game {
     this.lighting.update(this.focus);
     this.gfx.render(frameDelta);
 
+    this.minimap.update(frameDelta, () => ({
+      playerX: target.position.x,
+      playerZ: target.position.z,
+      playerHeading: target.heading,
+      // `traffic.obstacles` is the system's own persistent, post-step view — reading it here keeps
+      // the (throttled) minimap redraw free of per-redraw allocation.
+      traffic: this.traffic.obstacles,
+      pedestrians: this.pedestrians.positions,
+      police: this.refreshPoliceDots(),
+    }));
+
     this.hudAccum += frameDelta;
     if (this.hudAccum > 0.25) {
       this.hudAccum = 0;
       this.refreshHud();
     }
+  }
+
+  /** Police positions for the minimap, written into a persistent buffer. */
+  private refreshPoliceDots(): readonly { x: number; z: number }[] {
+    const cars = this.police.cars;
+    while (this.policeDots.length < cars.length) this.policeDots.push({ x: 0, z: 0 });
+    this.policeDots.length = cars.length;
+    for (let i = 0; i < cars.length; i++) {
+      const dot = this.policeDots[i]!;
+      dot.x = cars[i]!.state.x;
+      dot.z = cars[i]!.state.z;
+    }
+    return this.policeDots;
   }
 
   refreshHud(): void {
@@ -415,6 +645,8 @@ export class Game {
       shadows: this.quality.shadows,
       timeOfDay: this.timeOfDay,
       hint: this.hint,
+      wanted: this.wanted.level,
+      busted: this.busted,
     });
   }
 
@@ -451,11 +683,13 @@ export class Game {
     for (const v of this.vehicles) v.dispose(this.registry);
     this.traffic.dispose();
     this.pedestrians.dispose();
+    this.police.dispose(this.scene);
     this.player.dispose(this.registry);
     this.cityView.dispose();
     this.lighting.dispose();
     this.sky.dispose();
     this.hud.dispose();
+    this.minimap.dispose();
     this.gfx.dispose();
   }
 }

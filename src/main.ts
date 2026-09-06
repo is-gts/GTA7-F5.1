@@ -85,6 +85,10 @@ const api = {
       frame: game.engine.stats.frame,
       updates: game.engine.stats.updates,
       fixedDelta: game.engine.fixedDelta,
+      wanted: { level: game.wanted.level, heat: game.wanted.heat },
+      police: { count: game.police.count, pursuing: game.policePursuing, distance: game.police.nearestDistance(v ? v.state.x : p.x, v ? v.state.z : p.z) },
+      busted: game.busted,
+      minimap: { redraws: game.minimap.redraws },
     };
   },
   /** Render a frame and sample the default framebuffer: mean/variance of luminance over a grid. */

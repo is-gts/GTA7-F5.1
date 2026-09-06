@@ -84,6 +84,22 @@ export interface TrafficAgent {
   path: TrafficPath;
   /** Free-flow speed on a straight (m/s); actual speed is capped by turns/obstacles/yielding. */
   cruiseSpeed: number;
+  /**
+   * Speed (m/s) this agent negotiates an intersection fillet at (and brakes down to on the approach).
+   * `TURN_SPEED` for ordinary traffic; police cars (`src/ai/Police.ts`) take corners harder — still
+   * well inside the tyre limit for `CORNER_RADIUS`, but fast enough to actually run a fleeing car
+   * down instead of losing a whole block at every junction.
+   */
+  turnSpeed: number;
+  /**
+   * Distance (m) before the fillet at which this agent starts shedding speed for it, and distance
+   * (m) from a node at which it decides (and plans the fillet for) its next edge. The defaults
+   * (`TURN_SLOW_DIST` / `NODE_DECISION_DIST`) suit the 6-12 m/s civilian cruise; a police car
+   * cruising at 26 m/s needs ~30 m just to brake for a junction, so it looks (and commits) further
+   * ahead — otherwise it arrives at the corner far too fast however hard it brakes.
+   */
+  turnSlowDist: number;
+  decisionDist: number;
   /** Per-agent RNG for node decisions (deterministic given the parent seed). */
   rng: Random;
   /**
@@ -336,6 +352,9 @@ export function createTrafficAgent(
     spec,
     path: { ...path },
     cruiseSpeed,
+    turnSpeed: TURN_SPEED,
+    turnSlowDist: TURN_SLOW_DIST,
+    decisionDist: NODE_DECISION_DIST,
     rng,
     corner: { active: false, committed: false, nodeX: 0, nodeZ: 0, headingIn: 0, dir: 1, laneOffset: 0, radius: CORNER_RADIUS },
     turnAngle: 0,
@@ -717,18 +736,19 @@ export function computeTrafficInput(agent: TrafficAgent, city: CityData, obstacl
   const steer = clamp(desiredWheelAngle / agent.spec.maxSteerAngle, -1, 1);
 
   // --- speed ------------------------------------------------------------------------------------
+  const turnSpeed = agent.turnSpeed;
   let targetSpeed = agent.cruiseSpeed;
   if (ref.phase === PHASE_APPROACH) {
-    // Physically-motivated braking curve: "the speed from which TURN_SPEED is still reachable
+    // Physically-motivated braking curve: "the speed from which `turnSpeed` is still reachable
     // braking at TURN_BRAKE_DECEL over the distance left before the fillet".
     const toArc = Math.max(0, ref.arcDistance);
-    if (toArc < TURN_SLOW_DIST) targetSpeed = Math.min(targetSpeed, Math.sqrt(TURN_SPEED * TURN_SPEED + 2 * TURN_BRAKE_DECEL * toArc));
+    if (toArc < agent.turnSlowDist) targetSpeed = Math.min(targetSpeed, Math.sqrt(turnSpeed * turnSpeed + 2 * TURN_BRAKE_DECEL * toArc));
   } else if (ref.phase !== PHASE_LANE) {
-    targetSpeed = Math.min(targetSpeed, TURN_SPEED);
+    targetSpeed = Math.min(targetSpeed, turnSpeed);
   }
   // Don't accelerate back toward cruise while still visibly off the line or misaligned with it
   // (e.g. recovering after being shunted by another car).
-  if (Math.abs(crossTrackError) > TURN_HOLD_LATERAL || Math.abs(headingError) > TURN_HOLD_HEADING) targetSpeed = Math.min(targetSpeed, TURN_SPEED);
+  if (Math.abs(crossTrackError) > TURN_HOLD_LATERAL || Math.abs(headingError) > TURN_HOLD_HEADING) targetSpeed = Math.min(targetSpeed, turnSpeed);
   if (yielding) targetSpeed = 0;
   const passing = escaping && blockedDeadEnd;
   if (leaderGap < FOLLOW_GAP) {
@@ -762,6 +782,27 @@ export function computeTrafficInput(agent: TrafficAgent, city: CityData, obstacl
 const _releaseRef = createPathReference();
 
 /**
+ * Hooks that let another system reuse an agent's lane-following brain with its own routing and its
+ * own physics stepping. Both are optional; traffic itself passes neither.
+ */
+export interface AdvanceAgentOptions {
+  /**
+   * Choose the edge/lane to take at `nodeId`, having arrived on `arrivalEdgeId`. Defaults to
+   * `chooseNextPath` (a random legal turn). `src/ai/Police.ts` passes a chooser that heads for the
+   * player instead, which is the whole of a police car's route planning: everything else — lane
+   * centrelines, intersection fillets, following/yielding and the deadlock escape — is shared with
+   * ordinary traffic, which is what keeps a pursuing car on the road instead of in a building.
+   */
+  chooseNext?: (agent: TrafficAgent, nodeId: number, arrivalEdgeId: number) => TrafficPath;
+  /**
+   * Apply `input` to the agent for `dt` (including its own `prev` bookkeeping). Defaults to
+   * `stepVehicle` + `resolveVehicleStatic`; `PoliceSystem` passes `VehicleEntity.step` so a police
+   * car accumulates visible damage and animates its light bar like any other car.
+   */
+  step?: (agent: TrafficAgent, input: VehicleInput, dt: number) => void;
+}
+
+/**
  * Advance one agent by `dt`: compute its input, step the shared vehicle physics, resolve against
  * static geometry (if a grid is given) and update its path progress, transitioning to the next
  * edge once it reaches the node.
@@ -772,6 +813,7 @@ export function advanceTrafficAgent(
   dt: number,
   obstacles: readonly TrafficObstacle[],
   grid?: StaticColliderGrid,
+  opts?: AdvanceAgentOptions,
 ): void {
   Object.assign(agent.prev, agent.state);
   // Decide the next edge (and plan the corner onto it) well before the node, so the agent brakes
@@ -779,9 +821,9 @@ export function advanceTrafficAgent(
   if (!agent.pendingPath && !agent.corner.active) {
     const edge0 = city.roads.edges[agent.path.edgeId]!;
     const remaining = edge0.length * (1 - edgeProgress(city, edge0, agent.path.forward, agent.state.x, agent.state.z));
-    if (remaining < NODE_DECISION_DIST) {
+    if (remaining < agent.decisionDist) {
       const nodeId = targetNodeId(edge0, agent.path.forward);
-      const next = chooseNextPath(city, agent.rng, nodeId, edge0.id, agent.path.lane);
+      const next = opts?.chooseNext ? opts.chooseNext(agent, nodeId, edge0.id) : chooseNextPath(city, agent.rng, nodeId, edge0.id, agent.path.lane);
       agent.pendingPath = next;
       planCorner(agent.corner, city, edge0, agent.path.forward, agent.path.lane, next, nodeId);
     }
@@ -800,8 +842,12 @@ export function advanceTrafficAgent(
   }
 
   const input = computeTrafficInput(agent, city, obstacles);
-  stepVehicle(agent.state, agent.spec, input, dt);
-  if (grid) resolveVehicleStatic(agent.state, agent.spec, grid);
+  if (opts?.step) {
+    opts.step(agent, input, dt);
+  } else {
+    stepVehicle(agent.state, agent.spec, input, dt);
+    if (grid) resolveVehicleStatic(agent.state, agent.spec, grid);
+  }
 
   let edge = city.roads.edges[agent.path.edgeId]!;
   let t = edgeProgress(city, edge, agent.path.forward, agent.state.x, agent.state.z);
@@ -820,7 +866,7 @@ export function advanceTrafficAgent(
     // spawned within NODE_SWITCH_DIST of its very first node, before ever having a chance to).
     let nextPath = agent.pendingPath;
     if (!nextPath) {
-      nextPath = chooseNextPath(city, agent.rng, nodeId, edge.id, agent.path.lane);
+      nextPath = opts?.chooseNext ? opts.chooseNext(agent, nodeId, edge.id) : chooseNextPath(city, agent.rng, nodeId, edge.id, agent.path.lane);
       planCorner(agent.corner, city, edge, agent.path.forward, agent.path.lane, nextPath, nodeId);
     }
     const nextEdge = city.roads.edges[nextPath.edgeId]!;
@@ -856,6 +902,13 @@ export interface TrafficPopulationOptions {
    * agent pair every tick. Safe to omit (a fresh array is used instead) — tests do.
    */
   scratch?: TrafficObstacle[];
+  /**
+   * Called whenever an agent's physical separation against one of `extraVehicles` produces a
+   * non-trivial impulse (m/s of closing speed removed), with the index into `extraVehicles`. Used
+   * by `Game` to detect the player ramming a moving traffic car for the wanted system, without
+   * `TrafficSystem` needing to know anything about wanted levels itself.
+   */
+  onVehicleImpact?: (impulse: number, vehicleIndex: number) => void;
 }
 
 const EMPTY_OBSTACLES: readonly TrafficObstacle[] = [];
@@ -911,7 +964,8 @@ export function stepTrafficPopulation(agents: readonly TrafficAgent[], city: Cit
       const dx = a.state.x - ev.state.x;
       const dz = a.state.z - ev.state.z;
       if (dx * dx + dz * dz > collideDist2) continue;
-      resolveVehicleVehicle(a.state, a.spec, ev.state, ev.spec);
+      const impact = resolveVehicleVehicle(a.state, a.spec, ev.state, ev.spec);
+      if (impact && impact.impulse > 0) opts.onVehicleImpact?.(impact.impulse, k);
     }
   }
 }
@@ -1162,7 +1216,13 @@ export class TrafficSystem {
    * physically resolve against — pass a persistent, reused array (Game keeps one; the entries'
    * `state` objects are mutated in place, so no per-tick allocation is needed there either).
    */
-  update(dt: number, focus: TrafficFocus, grid: StaticColliderGrid, vehicles: readonly { state: VehicleState; spec: VehicleSpec }[]): void {
+  update(
+    dt: number,
+    focus: TrafficFocus,
+    grid: StaticColliderGrid,
+    vehicles: readonly { state: VehicleState; spec: VehicleSpec }[],
+    onVehicleImpact?: (impulse: number, vehicleIndex: number) => void,
+  ): void {
     const despawnAt = this.spawnRadius + this.despawnMargin;
     for (const slot of this.slots) {
       const agent = slot.agent;
@@ -1192,6 +1252,7 @@ export class TrafficSystem {
       extraObstacles: this.extraObstacleCache,
       extraVehicles: vehicles,
       scratch: this.scratchObstacles,
+      onVehicleImpact,
     });
     // Refresh the exposed obstacle view post-step (stepTrafficPopulation's own refresh happens
     // before each agent moves, for internal consistency — see stepTrafficPopulation's comment).
