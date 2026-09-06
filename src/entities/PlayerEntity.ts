@@ -1,8 +1,9 @@
 /**
  * The on-foot player: a stylised capsule figure driven by the character controller.
  */
-import { CapsuleGeometry, Color, Group, Mesh, MeshStandardMaterial, Object3D, SphereGeometry, BoxGeometry, Vector3 } from 'three';
+import { Color, Group, type Mesh, MeshStandardMaterial, Object3D, Vector3 } from 'three';
 import type { MaterialRegistry } from '../render/MaterialRegistry';
+import { buildHumanFigureRig } from './HumanFigure';
 import {
   DEFAULT_CHARACTER_SPEC,
   createCharacterState,
@@ -21,8 +22,8 @@ export class PlayerEntity {
   readonly state: CharacterState;
   readonly prev: CharacterState;
   readonly object = new Group();
-  private readonly legs: Object3D[] = [];
-  private readonly arms: Object3D[] = [];
+  private readonly legs: [Object3D, Object3D];
+  private readonly arms: [Object3D, Object3D];
   private readonly torso: Object3D;
   private walkPhase = 0;
   private readonly materials: MeshStandardMaterial[] = [];
@@ -36,32 +37,11 @@ export class PlayerEntity {
     const pants = registry.register(new MeshStandardMaterial({ color: 0x2b2b30, roughness: 0.9 }));
     this.materials.push(skin, shirt, pants);
 
-    this.torso = new Group();
-    const chest = new Mesh(new CapsuleGeometry(0.22, 0.42, 4, 10), shirt);
-    chest.position.y = 1.15;
-    const head = new Mesh(new SphereGeometry(0.15, 12, 10), skin);
-    head.position.y = 1.62;
-    chest.castShadow = head.castShadow = true;
-    this.torso.add(chest, head);
-    this.object.add(this.torso);
-    for (const side of [-1, 1]) {
-      const legPivot = new Object3D();
-      legPivot.position.set(side * 0.11, 0.85, 0);
-      const leg = new Mesh(new BoxGeometry(0.16, 0.85, 0.18), pants);
-      leg.position.y = -0.425;
-      leg.castShadow = true;
-      legPivot.add(leg);
-      this.object.add(legPivot);
-      this.legs.push(legPivot);
-      const armPivot = new Object3D();
-      armPivot.position.set(side * 0.3, 1.42, 0);
-      const arm = new Mesh(new BoxGeometry(0.11, 0.62, 0.12), shirt);
-      arm.position.y = -0.31;
-      arm.castShadow = true;
-      armPivot.add(arm);
-      this.torso.add(armPivot);
-      this.arms.push(armPivot);
-    }
+    const rig = buildHumanFigureRig({ skin, shirt, pants });
+    this.object.add(rig.object);
+    this.torso = rig.torso;
+    this.legs = rig.legs;
+    this.arms = rig.arms;
     this.syncVisual(1);
   }
 

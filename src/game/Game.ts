@@ -2,8 +2,10 @@
  * Top-level game composition: world, entities, rendering, input and the simulation loop.
  */
 import { Color, MathUtils, PerspectiveCamera, Scene, Vector3 } from 'three';
-import { TrafficSystem } from '../ai/Traffic';
+import { obstacleFromVehicle, TrafficSystem, type TrafficObstacle } from '../ai/Traffic';
+import { PedestrianSystem } from '../ai/Pedestrians';
 import { Engine } from '../core/Engine';
+import { EventBus } from '../core/EventBus';
 import { Input } from '../core/Input';
 import { detectQualityPreset, getPreset, isPresetName, saveQuality, type QualityPresetName, type QualitySettings } from '../core/Quality';
 import { CameraRig } from '../entities/CameraRig';
@@ -37,10 +39,18 @@ export const ENTER_VEHICLE_RADIUS = 5.5;
 
 const CAR_COLOURS = [0xc0392b, 0x2980b9, 0xf1c40f, 0x2c3e50, 0xecf0f1, 0x27ae60, 0x8e44ad, 0xe67e22];
 
+export interface GameEvents {
+  /** A pedestrian was struck by a vehicle moving faster than the knockdown threshold. */
+  pedestrianHit: { speed: number };
+  [key: string]: unknown;
+}
+
 export class Game {
   readonly engine = new Engine({ fixedDelta: 1 / 60 });
   readonly input = new Input();
   readonly registry = new MaterialRegistry();
+  /** Gameplay events (currently: `pedestrianHit`), for later systems (wanted level, HUD feedback). */
+  readonly events = new EventBus<GameEvents>();
   readonly scene = new Scene();
   readonly camera: PerspectiveCamera;
   readonly gfx: GameRenderer;
@@ -58,6 +68,14 @@ export class Game {
    */
   private readonly trafficVehicles: { state: VehicleState; spec: VehicleSpec }[] = [];
   readonly traffic: TrafficSystem;
+  readonly pedestrians: PedestrianSystem;
+  /**
+   * Persistent, index-aligned `TrafficObstacle` view of `vehicles` for the pedestrian AI (danger /
+   * knockdown checks) — refreshed in place each tick, built once since `vehicles` doesn't change.
+   */
+  private readonly pedestrianVehicleView: TrafficObstacle[] = [];
+  /** Combined (vehicles + traffic agents) obstacle scratch buffer, rebuilt in place each tick. */
+  private readonly pedestrianObstacles: TrafficObstacle[] = [];
   readonly cameraRig: CameraRig;
   cityView: CityView;
   quality: QualitySettings;
@@ -101,6 +119,8 @@ export class Game {
     this.spawnVehicles();
     this.traffic = new TrafficSystem(this.city, this.registry, this.quality, this.city.params.seed, this.trafficFocus());
     this.scene.add(this.traffic.object);
+    this.pedestrians = new PedestrianSystem(this.city, this.registry, this.quality, this.city.params.seed, this.trafficFocus());
+    this.scene.add(this.pedestrians.object);
 
     this.cameraRig = new CameraRig(this.camera, this.grid);
     this.cameraRig.snapTo(this.cameraTarget());
@@ -152,6 +172,7 @@ export class Game {
     this.lighting.onCameraChanged();
     this.gfx.applyQuality(q, this.scene, this.camera, this.dpr);
     this.traffic.rebuild(q, this.trafficFocus());
+    this.pedestrians.rebuild(q, this.trafficFocus());
     this.setTimeOfDay(this.timeOfDay, true);
     saveQuality(this.storage, q);
     this.hud.showToast(`Quality: ${q.preset}`);
@@ -248,6 +269,35 @@ export class Game {
     // Every vehicle (parked, and the driven one if any) is a follow/yield obstacle and a physical
     // collision partner for the traffic AI.
     this.traffic.update(dt, this.trafficFocus(), this.grid, this.trafficVehicles);
+    this.pedestrians.update(dt, this.trafficFocus(), this.grid, this.refreshPedestrianObstacles(), (speed) => this.events.emit('pedestrianHit', { speed }));
+  }
+
+  /**
+   * Combined (parked/player vehicles + traffic agents) obstacle view for the pedestrian AI's danger
+   * and knockdown checks, rebuilt in place each tick (both source arrays are themselves persistent
+   * and index-aligned, so this is index copies, not object allocation, beyond an occasional resize
+   * of the buffer itself).
+   */
+  private refreshPedestrianObstacles(): readonly TrafficObstacle[] {
+    if (this.pedestrianVehicleView.length !== this.vehicles.length) {
+      this.pedestrianVehicleView.length = 0;
+      for (const v of this.vehicles) this.pedestrianVehicleView.push(obstacleFromVehicle(v.state, v.spec));
+    } else {
+      for (let i = 0; i < this.vehicles.length; i++) {
+        const v = this.vehicles[i]!;
+        const ob = this.pedestrianVehicleView[i]!;
+        ob.x = v.state.x;
+        ob.z = v.state.z;
+        ob.heading = v.state.heading;
+        ob.forwardSpeed = v.state.forwardSpeed;
+      }
+    }
+    const trafficObstacles = this.traffic.obstacles;
+    this.pedestrianObstacles.length = this.pedestrianVehicleView.length + trafficObstacles.length;
+    let n = 0;
+    for (const ob of this.pedestrianVehicleView) this.pedestrianObstacles[n++] = ob;
+    for (const ob of trafficObstacles) this.pedestrianObstacles[n++] = ob;
+    return this.pedestrianObstacles;
   }
 
   /** Point the traffic system uses to decide what to spawn/despawn around (player or their car). */
@@ -312,6 +362,7 @@ export class Game {
   private render(alpha: number, frameDelta: number): void {
     for (const v of this.vehicles) v.syncVisual(alpha);
     this.traffic.syncVisual(alpha);
+    this.pedestrians.syncVisual(alpha);
     this.player.syncVisual(alpha);
     const target = this.cameraTarget();
     const s = this.input.state;
@@ -380,6 +431,7 @@ export class Game {
     this.stop();
     for (const v of this.vehicles) v.dispose(this.registry);
     this.traffic.dispose();
+    this.pedestrians.dispose();
     this.player.dispose(this.registry);
     this.cityView.dispose();
     this.lighting.dispose();

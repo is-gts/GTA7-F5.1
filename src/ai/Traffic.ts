@@ -1029,6 +1029,12 @@ export class TrafficSystem {
   private readonly scratchObstacles: TrafficObstacle[] = [];
   /** Reused, index-aligned `TrafficObstacle` view of the extra vehicles passed to `update()`. */
   private extraObstacleCache: TrafficObstacle[] = [];
+  /**
+   * Persistent view of every active agent as a `TrafficObstacle`, refreshed after each `update()`
+   * (post-step, so positions are current) so other systems — pedestrians reacting to traffic — can
+   * read it with no per-tick allocation of their own.
+   */
+  private readonly obstacleView: TrafficObstacle[] = [];
 
   constructor(
     private readonly city: CityData,
@@ -1180,6 +1186,23 @@ export class TrafficSystem {
       extraVehicles: vehicles,
       scratch: this.scratchObstacles,
     });
+    // Refresh the exposed obstacle view post-step (stepTrafficPopulation's own refresh happens
+    // before each agent moves, for internal consistency — see stepTrafficPopulation's comment).
+    this.obstacleView.length = this.agents.length;
+    for (let i = 0; i < this.agents.length; i++) {
+      const a = this.agents[i]!;
+      a.obstacle.x = a.state.x;
+      a.obstacle.z = a.state.z;
+      a.obstacle.heading = a.state.heading;
+      a.obstacle.forwardSpeed = a.state.forwardSpeed;
+      this.obstacleView[i] = a.obstacle;
+    }
+  }
+
+  /** Every active traffic agent as a `TrafficObstacle` (post-step positions), for systems that need
+   *  to react to traffic without depending on `TrafficSystem`'s own agent/pool internals. */
+  get obstacles(): readonly TrafficObstacle[] {
+    return this.obstacleView;
   }
 
   /** Interpolate every active pooled car between its previous and current physics state. */

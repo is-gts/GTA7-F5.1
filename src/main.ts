@@ -80,6 +80,7 @@ const api = {
       vehicle: v ? { x: v.state.x, z: v.state.z, heading: v.state.heading, speed: v.state.forwardSpeed, damage: v.damage } : null,
       vehicles: game.vehicles.length,
       traffic: game.traffic.stats,
+      pedestrians: game.pedestrians.stats,
       city: game.cityView.stats,
       frame: game.engine.stats.frame,
       updates: game.engine.stats.updates,
