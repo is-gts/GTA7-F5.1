@@ -185,6 +185,12 @@ export class Lighting {
   private disposeLights(): void {
     if (this.csm) {
       this.csm.remove();
+      // `CSM.dispose()` only tears down its shader/material patching bookkeeping — it never frees
+      // the shadow map render target each cascade's `DirectionalLight` lazily allocated once it
+      // actually cast a shadow. Left alone, every switch into/out of 'csm' mode leaks one texture
+      // per cascade (`renderer.info.memory.textures` only grows). `DirectionalLight.dispose()` does
+      // cascade to `shadow.dispose()`, so disposing each light here closes that gap.
+      for (const l of this.csm.lights) l.dispose();
       this.csm.dispose();
       this.csm = null;
     }

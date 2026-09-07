@@ -1,7 +1,7 @@
 /**
  * Top-level game composition: world, entities, rendering, input and the simulation loop.
  */
-import { Color, MathUtils, PerspectiveCamera, Scene, Vector3 } from 'three';
+import { Color, Object3D, PerspectiveCamera, Scene, SpotLight, Vector3 } from 'three';
 import { obstacleFromVehicle, TrafficSystem, type TrafficObstacle } from '../ai/Traffic';
 import { PedestrianSystem } from '../ai/Pedestrians';
 import { PoliceSystem, RAM_STOP_GAP, type PoliceFocus } from '../ai/Police';
@@ -18,13 +18,26 @@ import { StaticColliderGrid, type OBB } from '../physics/Collision';
 import { resolveVehicleVehicle, type VehicleSpec, type VehicleState } from '../physics/VehiclePhysics';
 import { GameRenderer } from '../render/GameRenderer';
 import { Lighting } from '../render/Lighting';
+import { LocalLights, type LampPoint } from '../render/LocalLights';
 import { MaterialRegistry } from '../render/MaterialRegistry';
 import { SkyDome } from '../render/SkyDome';
 import { HUD } from '../ui/HUD';
 import { Minimap } from '../ui/Minimap';
 import { Random } from '../world/Random';
 import { buildCity, type CityView } from '../world/CityBuilder';
-import { buildingAABBs, generateCity, lanePoint, type CityData, type CityParams } from '../world/CityGenerator';
+import { buildingAABBs, generateCity, lampHeadPosition, lanePoint, type CityData, type CityParams } from '../world/CityGenerator';
+import {
+  angleBetweenDeg,
+  daylightFactor,
+  moonDirection,
+  sunAngles,
+  DEFAULT_SECONDS_PER_GAME_HOUR,
+  ENV_REGEN_THRESHOLD_DEG,
+  TIME_UPDATE_MIN_GAME_HOURS,
+  TimeOfDay,
+  hoursDelta,
+  type Vec3,
+} from './TimeOfDay';
 import { addWantedHeat, createWantedState, policeCountForLevel, stepWanted, POLICE_CONTACT_RANGE, type WantedState } from './Wanted';
 
 export interface GameOptions {
@@ -35,6 +48,8 @@ export interface GameOptions {
   devicePixelRatio?: number;
   /** Initial time of day in hours (0..24). */
   timeOfDay?: number;
+  /** Real seconds per in-game hour (default 90 — a full day every 36 real minutes). */
+  secondsPerGameHour?: number;
   storage?: Storage | null;
 }
 
@@ -49,6 +64,18 @@ const HORN_RADIUS = 18;
 /** Collision impulse (m/s of closing speed removed) above which a vehicle-vehicle hit counts as a
  *  reckless "crash" for the wanted system. */
 const CRASH_IMPULSE_THRESHOLD = 4;
+
+/**
+ * Player headlight `SpotLight` intensity (candela, decay=1.4 — see the `new SpotLight(...)` call
+ * below) — bright enough to visibly light the road a car-length or two ahead. At the ~3 m closest
+ * usually-lit point on the road this contributes roughly HEADLIGHT_INTENSITY / 3^1.4 ≈ 39 to a
+ * diffuse surface's shading (comparable to the sun's ~2.8), safely under the ~64 HDR guideline.
+ * Only within ~2 m of the fixture itself (e.g. a pedestrian or wall the player noses directly
+ * into) does it exceed that guideline, and only mildly (~68 at 2 m) — nowhere near the ~65504
+ * half-float ceiling that would actually produce NaN, so this is a soft, accepted edge case rather
+ * than a real overflow risk.
+ */
+const HEADLIGHT_INTENSITY = 180;
 
 /** Player (or their car) must be slower than this and within `BUSTED_RANGE_GAP` (a body-to-body
  *  gap, not centre-to-centre — a cop parked nose-to-tail against the player is ~4.5 m of centre
@@ -107,6 +134,20 @@ export class Game {
   readonly pedestrians: PedestrianSystem;
   readonly police: PoliceSystem;
   readonly minimap: Minimap;
+  /** Deterministic day/night clock (see `TimeOfDay.ts`); advanced once per fixed `update()` tick. */
+  readonly clock: TimeOfDay;
+  /** Pooled real-time street lamps that track the player/vehicle (see `render/LocalLights.ts`). */
+  readonly localLights: LocalLights;
+  /** World-space lamp-head positions, computed once from the (static) city data. */
+  private readonly lampHeads: LampPoint[];
+  /** Player car headlights: two `SpotLight`s reparented onto whichever vehicle is currently driven
+   *  (medium+ only — `quality.maxLocalLights > 0`), on at night. AI traffic/police/parked cars keep
+   *  their existing emissive-only headlight glow (no real light). */
+  private readonly headlightL = new SpotLight(0xfff6df, HEADLIGHT_INTENSITY, 26, Math.PI / 8.5, 0.4, 1.4);
+  private readonly headlightR = new SpotLight(0xfff6df, HEADLIGHT_INTENSITY, 26, Math.PI / 8.5, 0.4, 1.4);
+  private readonly headlightTargetL = new Object3D();
+  private readonly headlightTargetR = new Object3D();
+  private headlightVehicle: VehicleEntity | null = null;
   wanted: WantedState = createWantedState();
   /** Whether at least one police car currently exists and is chasing the player. */
   policePursuing = false;
@@ -149,8 +190,14 @@ export class Game {
   mode: PlayerMode = 'foot';
   currentVehicle: VehicleEntity | null = null;
   paused = false;
-  private timeOfDay = 14;
-  private lastEnvTime = -1;
+  /** Sun direction (unit vector) at the time of the last PMREM environment regeneration. */
+  private lastEnvDir: Vec3 = { x: 0, y: 1, z: 0 };
+  /** Number of PMREM environment regenerations since construction (diagnostics / e2e). */
+  envRegens = 0;
+  /** `clock.hours` as of the last time lighting was actually recomputed (throttle bookkeeping). */
+  private lastAppliedHours = 0;
+  /** Current night factor (0 = full day, 1 = full night), refreshed by `applyTimeOfDay`. */
+  private nightFactor = 0;
   // Start at the refresh threshold so the very first rendered frame fills the HUD in (speed, stars,
   // perf line) instead of showing the constructor's placeholders for the first quarter second.
   private hudAccum = 1;
@@ -172,9 +219,27 @@ export class Game {
     this.scene.add(this.camera);
     this.sky = new SkyDome(this.gfx.renderer);
     this.scene.add(this.sky.sky);
+    this.scene.add(this.sky.stars);
     this.lighting = new Lighting(this.scene, this.camera, this.registry, this.quality);
+    this.localLights = new LocalLights(this.scene, this.quality);
+    this.clock = new TimeOfDay(opts.timeOfDay ?? 14, opts.secondsPerGameHour ?? DEFAULT_SECONDS_PER_GAME_HOUR);
+    this.lastAppliedHours = this.clock.hours;
+    this.headlightL.target = this.headlightTargetL;
+    this.headlightR.target = this.headlightTargetR;
+    this.headlightL.castShadow = false;
+    this.headlightR.castShadow = false;
+    this.headlightL.intensity = 0;
+    this.headlightR.intensity = 0;
+    // Permanently visible, permanently in the scene graph (reparented onto the driven vehicle in
+    // `syncHeadlights` and back here otherwise); on/off is driven purely by `intensity`. See the
+    // matching note on `LocalLights.update` — toggling `visible` on a light changes the compiled
+    // shader-program count for every lit material the first time a new count is seen.
+    this.headlightL.visible = true;
+    this.headlightR.visible = true;
+    this.scene.add(this.headlightL, this.headlightR, this.headlightTargetL, this.headlightTargetR);
 
     this.city = generateCity(opts.city);
+    this.lampHeads = this.city.lamps.map((l) => lampHeadPosition(l));
     this.vehicleRng = new Random(this.city.params.seed ^ 0x5eed1);
     this.grid = new StaticColliderGrid(32);
     for (const box of buildingAABBs(this.city)) this.grid.insert(box);
@@ -207,7 +272,7 @@ export class Game {
     this.cameraRig.snapTo(this.cameraTarget());
 
     this.gfx.applyQuality(this.quality, this.scene, this.camera, this.dpr);
-    this.setTimeOfDay(opts.timeOfDay ?? 14, true);
+    this.applyTimeOfDay(true);
     this.engine.addSystem({ update: (dt) => this.update(dt), render: (alpha, fd) => this.render(alpha, fd) });
     this.updateHint();
   }
@@ -258,9 +323,11 @@ export class Game {
     this.lighting.rebuild(q);
     this.lighting.onCameraChanged();
     this.gfx.applyQuality(q, this.scene, this.camera, this.dpr);
+    this.localLights.setQuality(q);
     this.traffic.rebuild(q, this.trafficFocus());
     this.pedestrians.rebuild(q, this.trafficFocus());
-    this.setTimeOfDay(this.timeOfDay, true);
+    this.applyTimeOfDay(true);
+    this.syncHeadlights();
     saveQuality(this.storage, q);
     this.hud.showToast(`Quality: ${q.preset}`);
     this.updateHint();
@@ -268,24 +335,36 @@ export class Game {
 
   // --- time of day -----------------------------------------------------------
   get currentTimeOfDay(): number {
-    return this.timeOfDay;
+    return this.clock.hours;
   }
 
+  /** Jump the clock directly to `hours` (used by the debug API / `?tod=`) and recompute lighting. */
   setTimeOfDay(hours: number, forceEnv = false): void {
-    this.timeOfDay = ((hours % 24) + 24) % 24;
-    const t = (this.timeOfDay - 6) / 12; // 0 at 06:00, 1 at 18:00
-    const elevation = Math.sin(t * Math.PI) * 65;
-    const azimuth = 90 + t * 180;
-    this.sky.setSun(elevation, azimuth);
-    const daylight = MathUtils.smoothstep(elevation, -6, 10);
+    this.clock.set(hours);
+    this.lastAppliedHours = this.clock.hours;
+    this.applyTimeOfDay(forceEnv);
+  }
+
+  /**
+   * Recompute sun/moon direction, fog, hemisphere, night materials, vehicle-light toggles and (at
+   * most every `ENV_REGEN_THRESHOLD_DEG` of sun movement) the PMREM environment, from `clock.hours`.
+   * Called from `update()` at most every `TIME_UPDATE_MIN_GAME_HOURS` of game time — everything here
+   * changes slowly enough (over game-minutes) that per-frame recomputation would be pure waste.
+   */
+  private applyTimeOfDay(forceEnv: boolean): void {
+    const hours = this.clock.hours;
+    const angles = sunAngles(hours);
+    this.sky.setSun(angles.elevationDeg, angles.azimuthDeg);
+    const daylight = daylightFactor(hours);
     const night = 1 - daylight;
-    if (elevation > -2) {
+    this.nightFactor = night;
+    if (angles.elevationDeg > -2) {
       this.lighting.sunDirection.copy(this.sky.sunDirection);
       this.lighting.setSun({ color: this.sky.sunColor(), intensity: Math.max(0.12, this.sky.sunIntensity()) });
     } else {
       // Moonlight: a faint cool light from the sun's antipode so night surfaces stay readable.
-      const d = this.sky.sunDirection;
-      this.lighting.sunDirection.set(-d.x, Math.max(0.35, -d.y), -d.z).normalize();
+      const m = moonDirection(hours);
+      this.lighting.sunDirection.set(m.x, m.y, m.z);
       this.lighting.setSun({ color: new Color(0x8fa6d8), intensity: 0.18 });
     }
     const horizon = this.sky.horizonColor();
@@ -302,14 +381,66 @@ export class Game {
     this.police.setLights(night > 0.5);
     this.scene.environmentIntensity = 0.25 + 0.75 * daylight;
     if (this.quality.envReflections) {
-      if (forceEnv || Math.abs(this.timeOfDay - this.lastEnvTime) > 0.25) {
+      const sunDir = this.sky.sunDirection;
+      const angleMoved = angleBetweenDeg(this.lastEnvDir, { x: sunDir.x, y: sunDir.y, z: sunDir.z });
+      if (forceEnv || angleMoved > ENV_REGEN_THRESHOLD_DEG) {
         this.scene.environment = this.sky.updateEnvironment();
-        this.lastEnvTime = this.timeOfDay;
+        this.lastEnvDir = { x: sunDir.x, y: sunDir.y, z: sunDir.z };
+        this.envRegens++;
       }
     } else {
       this.scene.environment = null;
     }
     this.scene.background = null; // the sky mesh provides the background
+    // "Night vision" exposure lift and the headlight on/off toggle both key off `night`, which just
+    // changed — no need to wait for the next per-frame update.
+    this.gfx.setNightExposureBoost(night);
+    this.syncHeadlights();
+  }
+
+  /** Advance the clock, applying lighting at most every `TIME_UPDATE_MIN_GAME_HOURS` of game time. */
+  private updateClock(dt: number): void {
+    this.clock.advance(dt);
+    if (Math.abs(hoursDelta(this.lastAppliedHours, this.clock.hours)) >= TIME_UPDATE_MIN_GAME_HOURS) {
+      this.lastAppliedHours = this.clock.hours;
+      this.applyTimeOfDay(false);
+    }
+  }
+
+  /**
+   * Reparent the two headlight `SpotLight`s onto whichever vehicle is currently driven (or back
+   * onto the scene root when not driving) and set their on/off state — driven by both the quality
+   * gate (`maxLocalLights > 0`) and the current night factor. Cheap and idempotent, so it's called
+   * from every place that can change either input (enter/exit vehicle, quality switch, time of day)
+   * instead of needing its own per-frame poll.
+   *
+   * The lights stay `visible = true` and attached *somewhere* in the scene graph at all times —
+   * only `intensity` ever turns them off — for the same shader-program-stability reason as
+   * `LocalLights.update`: reparenting between the vehicle body and the scene root doesn't change
+   * how many visible spot lights three.js sees, but toggling `visible` would.
+   */
+  private syncHeadlights(): void {
+    const shouldExist = this.mode === 'vehicle' && this.currentVehicle !== null && this.quality.maxLocalLights > 0;
+    if (shouldExist && this.headlightVehicle !== this.currentVehicle) {
+      const v = this.currentVehicle!;
+      const y = v.spec.wheelRadius + 0.56;
+      const side = v.spec.halfWidth - 0.3;
+      this.headlightL.position.set(-side, y, v.spec.halfLength + 0.05);
+      this.headlightR.position.set(side, y, v.spec.halfLength + 0.05);
+      this.headlightTargetL.position.set(-side * 0.4, y - 0.5, v.spec.halfLength + 20);
+      this.headlightTargetR.position.set(side * 0.4, y - 0.5, v.spec.halfLength + 20);
+      v.body.add(this.headlightL, this.headlightTargetL, this.headlightR, this.headlightTargetR);
+      this.headlightVehicle = v;
+    } else if (!shouldExist && this.headlightVehicle !== null) {
+      // Back onto the scene root (never fully removed) — position is irrelevant once intensity
+      // drops to 0 below.
+      this.scene.add(this.headlightL, this.headlightTargetL, this.headlightR, this.headlightTargetR);
+      this.headlightVehicle = null;
+    }
+    const on = shouldExist && this.nightFactor > 0.5;
+    const intensity = on ? HEADLIGHT_INTENSITY : 0;
+    this.headlightL.intensity = intensity;
+    this.headlightR.intensity = intensity;
   }
 
   // --- simulation ---------------------------------------------------------------
@@ -321,6 +452,7 @@ export class Game {
       if (name && isPresetName(name) && name !== this.quality.preset) this.setQualityPreset(name);
     }
     if (this.paused) return;
+    this.updateClock(dt);
 
     // While the "BUSTED" overlay is up, the player (on foot or in a car) is frozen — no movement
     // input is processed — so the fade genuinely reads as "caught", not "still driving with a red
@@ -490,6 +622,7 @@ export class Game {
     this.wanted = createWantedState();
     this.police.dispose(this.scene);
     this.policePursuing = false;
+    this.syncHeadlights();
     this.updateHint();
   }
 
@@ -564,6 +697,7 @@ export class Game {
       this.mode = 'foot';
       this.hud.showToast('Exited vehicle');
     }
+    this.syncHeadlights();
     this.updateHint();
   }
 
@@ -595,6 +729,10 @@ export class Game {
     this.camera.updateMatrixWorld();
     this.focus.copy(target.position);
     this.lighting.update(this.focus);
+    // Position-dependent, so these run every frame (unlike the throttled `applyTimeOfDay`, which
+    // only ever changes the cached `nightFactor` they read).
+    this.localLights.update(this.lampHeads, this.focus.x, this.focus.z, this.nightFactor);
+    this.sky.updateStars(this.camera.position, this.nightFactor);
     this.gfx.render(frameDelta);
 
     this.minimap.update(frameDelta, () => ({
@@ -643,7 +781,7 @@ export class Game {
       aa: this.gfx.pipeline?.info.aa ?? 'none',
       ao: this.gfx.pipeline?.info.ao ?? 'none',
       shadows: this.quality.shadows,
-      timeOfDay: this.timeOfDay,
+      timeOfDay: this.clock.hours,
       hint: this.hint,
       wanted: this.wanted.level,
       busted: this.busted,
@@ -680,6 +818,11 @@ export class Game {
 
   dispose(): void {
     this.stop();
+    this.headlightL.removeFromParent();
+    this.headlightR.removeFromParent();
+    this.headlightTargetL.removeFromParent();
+    this.headlightTargetR.removeFromParent();
+    this.localLights.dispose();
     for (const v of this.vehicles) v.dispose(this.registry);
     this.traffic.dispose();
     this.pedestrians.dispose();

@@ -28,7 +28,12 @@ describe('quality presets', () => {
       expect(b.drawDistance).toBeGreaterThanOrEqual(a.drawDistance);
       expect(b.maxTraffic).toBeGreaterThanOrEqual(a.maxTraffic);
       expect(b.anisotropy).toBeGreaterThanOrEqual(a.anisotropy);
+      expect(b.maxLocalLights).toBeGreaterThanOrEqual(a.maxLocalLights);
     }
+    expect(QUALITY_PRESETS.low.maxLocalLights).toBe(0);
+    expect(QUALITY_PRESETS.medium.maxLocalLights).toBe(4);
+    expect(QUALITY_PRESETS.high.maxLocalLights).toBe(8);
+    expect(QUALITY_PRESETS.ultra.maxLocalLights).toBe(16);
     expect(QUALITY_PRESETS.low.ao).toBe('none');
     expect(QUALITY_PRESETS.ultra.ao).toBe('gtao');
     expect(QUALITY_PRESETS.low.damageSmoke).toBe(false);

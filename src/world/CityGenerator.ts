@@ -101,6 +101,31 @@ export interface Lamp {
   chunkKey: string;
 }
 
+/**
+ * The lamp head geometry (`CityBuilder`'s `lampGeo`: a pole + an arm reaching `LAMP_HEAD_FORWARD` m
+ * forward along local +Z, capped by the light fixture) is instanced with position
+ * `(lamp.x, 0.15, lamp.z)` and a yaw of `lamp.rotY` about +Y. These constants and the helper below
+ * are the single source of truth for where the actual light-emitting point ends up in world space,
+ * shared by the low-preset ground decal and the real `PointLight` pool (`render/LocalLights.ts`) so
+ * both agree with what the player actually sees hanging over the sidewalk.
+ */
+export const LAMP_HEAD_FORWARD = 1.7;
+export const LAMP_HEAD_HEIGHT = 6.0;
+
+export interface LampHead {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** World-space position of a lamp's light fixture (see `LAMP_HEAD_FORWARD`/`LAMP_HEAD_HEIGHT`). */
+export function lampHeadPosition(lamp: Lamp, out: LampHead = { x: 0, y: 0, z: 0 }): LampHead {
+  out.x = lamp.x + LAMP_HEAD_FORWARD * Math.sin(lamp.rotY);
+  out.y = LAMP_HEAD_HEIGHT;
+  out.z = lamp.z + LAMP_HEAD_FORWARD * Math.cos(lamp.rotY);
+  return out;
+}
+
 export interface Tree {
   x: number;
   z: number;

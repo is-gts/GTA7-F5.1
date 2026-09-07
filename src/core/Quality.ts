@@ -55,6 +55,9 @@ export interface QualitySettings {
   propDensity: number;
   /** Damage-smoke particle emitter on badly damaged vehicles (cheap `Points`; off on low). */
   damageSmoke: boolean;
+  /** Max real-time `PointLight`s for nearby street lamps at night (`render/LocalLights.ts`); also
+   *  gates the player car's headlight `SpotLight`s (0 = none, low falls back to ground decals). */
+  maxLocalLights: number;
 }
 
 export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
@@ -85,6 +88,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxPolice: 3,
     propDensity: 0.5,
     damageSmoke: false,
+    maxLocalLights: 0,
   },
   medium: {
     preset: 'medium',
@@ -113,6 +117,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxPolice: 4,
     propDensity: 0.75,
     damageSmoke: true,
+    maxLocalLights: 4,
   },
   high: {
     preset: 'high',
@@ -141,6 +146,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxPolice: 5,
     propDensity: 1,
     damageSmoke: true,
+    maxLocalLights: 8,
   },
   ultra: {
     preset: 'ultra',
@@ -169,6 +175,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     maxPolice: 5,
     propDensity: 1,
     damageSmoke: true,
+    maxLocalLights: 16,
   },
 };
 

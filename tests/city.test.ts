@@ -7,6 +7,7 @@ import {
   generateCity,
   gridLine,
   laneOffsets,
+  lampHeadPosition,
   lanePoint,
 } from '../src/world/CityGenerator';
 import { aabbOverlap } from '../src/physics/Collision';
@@ -130,5 +131,42 @@ describe('generateCity', () => {
   it('rejects invalid params', () => {
     expect(() => generateCity({ cols: 0 })).toThrow();
     expect(() => generateCity({ roadWidth: 2 })).toThrow();
+  });
+});
+
+describe('lampHeadPosition', () => {
+  it('offsets forward along the lamp arm by rotY, matching the four cardinal orientations', () => {
+    const base = { x: 10, z: 20, rotY: 0, chunkKey: 'k' };
+    const north = lampHeadPosition({ ...base, rotY: Math.PI });
+    const south = lampHeadPosition({ ...base, rotY: 0 });
+    const west = lampHeadPosition({ ...base, rotY: -Math.PI / 2 });
+    const east = lampHeadPosition({ ...base, rotY: Math.PI / 2 });
+    expect(south.z).toBeGreaterThan(base.z);
+    expect(south.x).toBeCloseTo(base.x, 5);
+    expect(north.z).toBeLessThan(base.z);
+    expect(north.x).toBeCloseTo(base.x, 5);
+    expect(east.x).toBeGreaterThan(base.x);
+    expect(east.z).toBeCloseTo(base.z, 5);
+    expect(west.x).toBeLessThan(base.x);
+    expect(west.z).toBeCloseTo(base.z, 5);
+    // Same height for every orientation.
+    expect(north.y).toBe(south.y);
+    expect(east.y).toBe(west.y);
+    expect(north.y).toBeGreaterThan(5); // well above the ground (lamp head, not the base)
+  });
+
+  it('reuses the `out` object when given one, without allocating a new one', () => {
+    const out = { x: 0, y: 0, z: 0 };
+    const result = lampHeadPosition({ x: 1, z: 2, rotY: 0.5, chunkKey: 'k' }, out);
+    expect(result).toBe(out);
+  });
+
+  it('every generated lamp has a head strictly above ground and near its base', () => {
+    const city = generateCity({ seed: 3, cols: 3, rows: 3 });
+    for (const l of city.lamps.slice(0, 20)) {
+      const head = lampHeadPosition(l);
+      expect(head.y).toBeGreaterThan(3);
+      expect(Math.hypot(head.x - l.x, head.z - l.z)).toBeLessThan(3);
+    }
   });
 });

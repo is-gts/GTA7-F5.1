@@ -40,6 +40,8 @@ export class GameRenderer {
   private renderScale = 1;
   private scene: Scene | null = null;
   private camera: PerspectiveCamera | null = null;
+  /** Exposure at `nightBoost = 0` (set per quality preset in `applyRendererSettings`). */
+  private baseExposure = 0.85;
 
   constructor(readonly canvas: HTMLCanvasElement, quality: QualitySettings, devicePixelRatio = 1) {
     this.quality = quality;
@@ -94,7 +96,8 @@ export class GameRenderer {
   private applyRendererSettings(q: QualitySettings): void {
     const r = this.renderer;
     r.toneMapping = q.toneMapping === 'agx' ? AgXToneMapping : q.toneMapping === 'neutral' ? NeutralToneMapping : ACESFilmicToneMapping;
-    r.toneMappingExposure = q.toneMapping === 'agx' ? 1.0 : 0.85;
+    this.baseExposure = q.toneMapping === 'agx' ? 1.0 : 0.85;
+    r.toneMappingExposure = this.baseExposure;
     r.shadowMap.enabled = q.shadows !== 'none';
     // r185: PCFShadowMap is a Vogel-disk soft PCF whose width is `light.shadow.radius` (set in Lighting);
     // PCFSoftShadowMap is deprecated.
@@ -132,6 +135,17 @@ export class GameRenderer {
       this.camera.updateProjectionMatrix();
     }
     this.pipeline?.setSize(this.cssWidth, this.cssHeight);
+  }
+
+  /**
+   * "Night vision" exposure lift: as daylight fades, ease `toneMappingExposure` up so the (much
+   * darker, largely lamp/headlight-lit) scene stays readable. `night` is 0..1; the boost is clamped
+   * to a sane range (up to +35% of the preset's base exposure) and is a pure function of `night`, so
+   * it stays deterministic across identical `setTimeOfDay` sequences.
+   */
+  setNightExposureBoost(night: number): void {
+    const boost = 1 + 0.35 * Math.max(0, Math.min(1, night));
+    this.renderer.toneMappingExposure = this.baseExposure * boost;
   }
 
   setRenderScale(scale: number): void {

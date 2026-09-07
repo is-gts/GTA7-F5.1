@@ -31,6 +31,7 @@ const seed = Number(params.get('seed') ?? '7');
 const cols = params.get('cols');
 const rows = params.get('rows');
 const tod = params.get('tod');
+const dayspeed = params.get('dayspeed');
 const autostart = params.get('autostart') !== '0';
 
 const game = new Game({
@@ -44,6 +45,7 @@ const game = new Game({
   },
   devicePixelRatio: window.devicePixelRatio || 1,
   timeOfDay: tod ? Number(tod) : 14,
+  ...(dayspeed ? { secondsPerGameHour: Math.max(0.01, Number(dayspeed)) } : {}),
   storage,
 });
 
@@ -89,6 +91,9 @@ const api = {
       police: { count: game.police.count, pursuing: game.policePursuing, distance: game.police.nearestDistance(v ? v.state.x : p.x, v ? v.state.z : p.z) },
       busted: game.busted,
       minimap: { redraws: game.minimap.redraws },
+      time: game.currentTimeOfDay,
+      envRegens: game.envRegens,
+      localLights: { active: game.localLights.active, max: game.quality.maxLocalLights },
     };
   },
   /** Render a frame and sample the default framebuffer: mean/variance of luminance over a grid. */
@@ -118,7 +123,20 @@ const api = {
       }
     }
     const mean = sum / n;
-    return { width: w, height: h, mean, variance: sum2 / n - mean * mean, darkFraction: dark / n, samples: rows };
+    // A sparse grid (above) is fine for overall exposure/contrast, but it can step clean over tiny
+    // isolated bright details — a couple of 2 px star points against an otherwise near-black sky,
+    // say — that a coarse variance check can't tell apart from "nothing rendered". The framebuffer
+    // is already fully read into `buf` above, so a full-resolution scan for the brightest pixel and
+    // how many clear the "distinctly brighter than night ambient" bar costs nothing extra to fetch.
+    const brightThreshold = 0.28;
+    let maxLuminance = 0;
+    let brightCount = 0;
+    for (let i = 0; i < buf.length; i += 4) {
+      const l = (0.2126 * buf[i]! + 0.7152 * buf[i + 1]! + 0.0722 * buf[i + 2]!) / 255;
+      if (l > maxLuminance) maxLuminance = l;
+      if (l > brightThreshold) brightCount++;
+    }
+    return { width: w, height: h, mean, variance: sum2 / n - mean * mean, darkFraction: dark / n, samples: rows, maxLuminance, brightCount };
   },
 };
 (window as unknown as { __gta7: typeof api }).__gta7 = api;

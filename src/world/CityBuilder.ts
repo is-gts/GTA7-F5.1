@@ -10,6 +10,7 @@
  *  - Roads / sidewalks / props merged per chunk (or city-wide) into single geometries.
  */
 import {
+  AdditiveBlending,
   BoxGeometry,
   BufferAttribute,
   BufferGeometry,
@@ -24,6 +25,7 @@ import {
   LOD,
   Matrix4,
   Mesh,
+  MeshBasicMaterial,
   MeshLambertMaterial,
   MeshStandardMaterial,
   Object3D,
@@ -41,12 +43,13 @@ import {
   createAsphaltMaps,
   createConcreteMap,
   createFacadeMaps,
+  createGlowSprite,
   createGrassMap,
   createRoadMaps,
   type FacadeMaps,
 } from '../render/Textures';
 import { Random } from './Random';
-import { FACADE_STYLE_COUNT, blockPitch, laneOffsets, type Building, type ChunkInfo, type CityData } from './CityGenerator';
+import { FACADE_STYLE_COUNT, blockPitch, laneOffsets, lampHeadPosition, type Building, type ChunkInfo, type CityData } from './CityGenerator';
 
 export interface CityView {
   root: Group;
@@ -189,7 +192,32 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
   const texSize = quality.preset === 'low' ? 256 : quality.preset === 'medium' ? 512 : 1024;
   const disposables: { dispose(): void }[] = [];
   const nightMaterials: { mat: MeshStandardMaterial; day: number; night: number }[] = [];
+  /** Same idea as `nightMaterials` but for unlit additive materials driven by opacity instead of
+   *  `emissiveIntensity` (the low-preset light-pool decals below). */
+  const nightOpacityMaterials: { mat: Material & { opacity: number }; day: number; night: number }[] = [];
   let instancedMeshes = 0;
+
+  // Cheap "streets look lit" substitute for real PointLights (`render/LocalLights.ts`) on the low
+  // preset, where `quality.maxLocalLights === 0`: a flat additive quad with a radial-gradient
+  // texture on the ground under each lamp head, faded in at night. Built once and shared (as an
+  // InstancedMesh per chunk, like the lamp posts themselves) so it costs one draw call per chunk.
+  const lightPoolDecals = quality.maxLocalLights === 0;
+  const poolQuadGeo = lightPoolDecals ? flatQuad(-0.5, -0.5, 0.5, 0.5, 0, 'x', 1, 1) : null;
+  const poolTex = lightPoolDecals ? createGlowSprite(32) : null;
+  const poolMat = lightPoolDecals
+    ? new MeshBasicMaterial({ map: poolTex, color: 0xffb066, transparent: true, opacity: 0, depthWrite: false, blending: AdditiveBlending })
+    : null;
+  if (poolMat) {
+    registry.register(poolMat, { csm: false });
+    nightOpacityMaterials.push({ mat: poolMat, day: 0, night: 0.6 });
+    disposables.push(poolMat);
+  }
+  if (poolTex) disposables.push(poolTex);
+  if (poolQuadGeo) disposables.push(poolQuadGeo);
+  /** Diameter (m) of one lamp's ground light pool. */
+  const LIGHT_POOL_SIZE = 7;
+  /** Just above the sidewalk surface (built at y=0.15 below) to avoid z-fighting. */
+  const LIGHT_POOL_Y = 0.155;
 
   // --- materials ------------------------------------------------------------
   const facadeSets: FacadeMaterialSet[] = [];
@@ -376,6 +404,22 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
       mesh.computeBoundingSphere();
       near.add(mesh);
       instancedMeshes++;
+
+      if (poolQuadGeo && poolMat) {
+        const pool = new InstancedMesh(poolQuadGeo, poolMat, lamps.length);
+        lamps.forEach((l, i) => {
+          const head = lampHeadPosition(l);
+          pos.set(head.x - chunk.cx, LIGHT_POOL_Y, head.z - chunk.cz);
+          scl.set(LIGHT_POOL_SIZE, 1, LIGHT_POOL_SIZE);
+          m.compose(pos, q.identity(), scl);
+          pool.setMatrixAt(i, m);
+        });
+        pool.castShadow = false;
+        pool.receiveShadow = false;
+        pool.computeBoundingSphere();
+        near.add(pool);
+        instancedMeshes++;
+      }
     }
     // trees
     const trees = (chunkTrees.get(chunk.key) ?? []).filter((_, i) => i % propStride === 0);
@@ -499,6 +543,7 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
     setNightFactor(f: number) {
       const t = Math.max(0, Math.min(1, f));
       for (const n of nightMaterials) n.mat.emissiveIntensity = n.day + (n.night - n.day) * t;
+      for (const n of nightOpacityMaterials) n.mat.opacity = n.day + (n.night - n.day) * t;
     },
     visibleChunks(cameraPosition: Vector3): number {
       let n = 0;
@@ -518,6 +563,7 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
         if (mesh.geometry && !disposables.includes(mesh.geometry)) mesh.geometry.dispose();
       });
       for (const [mat] of [[roofMat], [roofFarMat], [roadMat], [asphaltMat], [concreteMat], [grassMat], [lampMetal], [lampHead], [bark], [leaves]] as [Material][]) registry.unregister(mat);
+      if (poolMat) registry.unregister(poolMat);
       for (const s of facadeSets) {
         registry.unregister(s.near);
         registry.unregister(s.far);

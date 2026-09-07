@@ -3,8 +3,55 @@
  * lighting environment generated from it with PMREM. The environment gives PBR materials
  * physically plausible specular reflections (car paint, glass) without any HDRI download.
  */
-import { Color, MathUtils, PMREMGenerator, Scene, Vector3, type Texture, type WebGLRenderTarget, type WebGLRenderer } from 'three';
+import {
+  AdditiveBlending,
+  BufferGeometry,
+  Color,
+  Float32BufferAttribute,
+  MathUtils,
+  PMREMGenerator,
+  Points,
+  PointsMaterial,
+  Scene,
+  Vector3,
+  type Texture,
+  type WebGLRenderTarget,
+  type WebGLRenderer,
+} from 'three';
 import { Sky } from 'three/addons/objects/Sky.js';
+import { Random } from '../world/Random';
+
+/** Fixed, city-independent seed: the star field is decoration, not part of the simulated world. */
+const STAR_SEED = 0xa5717a17;
+const STAR_COUNT = 2400;
+/** Radius (m) of the star shell — inside every quality preset's camera far plane (>= 1300 m). */
+const STAR_RADIUS = 900;
+
+function buildStarGeometry(): BufferGeometry {
+  const rng = new Random(STAR_SEED);
+  const positions = new Float32Array(STAR_COUNT * 3);
+  const colors = new Float32Array(STAR_COUNT * 3);
+  const tint = new Color();
+  for (let i = 0; i < STAR_COUNT; i++) {
+    // Uniform point on a sphere (Marsaglia): u in [-1,1] gives cos(polar angle).
+    const u = rng.range(-1, 1);
+    const theta = rng.range(0, Math.PI * 2);
+    const r = Math.sqrt(Math.max(0, 1 - u * u));
+    positions[i * 3] = r * Math.cos(theta) * STAR_RADIUS;
+    positions[i * 3 + 1] = u * STAR_RADIUS;
+    positions[i * 3 + 2] = r * Math.sin(theta) * STAR_RADIUS;
+    // Mostly white, a few warm/cool outliers for variety.
+    const warmth = rng.range(-1, 1);
+    tint.setRGB(1, 1, 1).offsetHSL(0, 0, 0).lerp(new Color(warmth > 0 ? 0xfff0d0 : 0xd0e4ff), Math.abs(warmth) * 0.5);
+    colors[i * 3] = tint.r;
+    colors[i * 3 + 1] = tint.g;
+    colors[i * 3 + 2] = tint.b;
+  }
+  const geo = new BufferGeometry();
+  geo.setAttribute('position', new Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new Float32BufferAttribute(colors, 3));
+  return geo;
+}
 
 /**
  * The Preetham sky shader outputs radiance in arbitrary units that are roughly 5-10x brighter
@@ -34,6 +81,11 @@ export class SkyDome {
   readonly sunPosition = new Vector3();
   elevation = 40;
   azimuth = 60;
+  /** Night star field: a fixed shell of points centred on the camera (position-only, so it never
+   *  rotates with the view — see `updateStars`), faded in by `nightFactor`. */
+  readonly stars: Points;
+  private readonly starsGeo: BufferGeometry;
+  private readonly starsMat: PointsMaterial;
 
   constructor(private readonly renderer: WebGLRenderer) {
     this.sky = new Sky();
@@ -51,6 +103,39 @@ export class SkyDome {
     this.pmrem = new PMREMGenerator(renderer);
     this.setSun(this.elevation, this.azimuth);
     this.setAtmosphere({ turbidity: 4, rayleigh: 1.6, mieCoefficient: 0.004, mieDirectionalG: 0.85 });
+
+    this.starsGeo = buildStarGeometry();
+    this.starsMat = new PointsMaterial({
+      size: 2.2,
+      sizeAttenuation: false,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      blending: AdditiveBlending,
+      toneMapped: false,
+      // Stars sit at STAR_RADIUS (900 m), well beyond the scene fog's `far` on low/medium presets
+      // (500-800 m draw distance); PointsMaterial defaults to `fog: true`, which would blend every
+      // star to the (near-black) fog colour before it ever reaches the eye, making the whole field
+      // invisible. Stars are outside the atmosphere and must never be fogged.
+      fog: false,
+    });
+    this.stars = new Points(this.starsGeo, this.starsMat);
+    this.stars.name = 'stars';
+    // Never culled: the whole point is that it always surrounds the camera regardless of its
+    // (deliberately never recomputed, since the geometry itself is centred on the origin) bounds.
+    this.stars.frustumCulled = false;
+  }
+
+  /**
+   * Recentre the star shell on the camera (translation only — its individual point directions stay
+   * fixed in world space, so turning the camera correctly reveals different stars) and fade it with
+   * the night factor (0..1).
+   */
+  updateStars(cameraPosition: Vector3, night: number): void {
+    this.stars.position.copy(cameraPosition);
+    const t = MathUtils.clamp((night - 0.2) / 0.8, 0, 1);
+    this.starsMat.opacity = t;
   }
 
   setAtmosphere(p: { turbidity?: number; rayleigh?: number; mieCoefficient?: number; mieDirectionalG?: number }): void {
@@ -119,5 +204,8 @@ export class SkyDome {
     this.sky.material.dispose();
     this.envSky.geometry.dispose();
     this.envSky.material.dispose();
+    this.stars.removeFromParent();
+    this.starsGeo.dispose();
+    this.starsMat.dispose();
   }
 }
