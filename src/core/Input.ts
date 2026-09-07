@@ -83,6 +83,10 @@ const KEY_BINDINGS = {
 
 type Action = keyof typeof KEY_BINDINGS;
 
+/** Matches any element inside a settings menu that is currently open (`Menu.close()` sets
+ *  `root.hidden`, which reflects to the `hidden` attribute). See `Input.isUiTarget`. */
+const OPEN_MENU_SELECTOR = '.settings-menu:not([hidden])';
+
 export class Input {
   readonly state: InputState = createEmptyInputState();
   readonly virtual: VirtualInput = {
@@ -104,6 +108,9 @@ export class Input {
   private readonly keyToActions = new Map<string, Action[]>();
   /** Smoothed analog steer from digital keys so keyboard driving is not twitchy. */
   private keySteer = 0;
+  /** One-shot edge-triggered actions queued by touch UI buttons (see `TouchControls`), consumed by
+   *  the next `poll()` alongside the equivalent keyboard/gamepad edge. */
+  private readonly virtualPress = new Set<'interact' | 'cameraToggle' | 'horn'>();
 
   constructor() {
     for (const [action, codes] of Object.entries(KEY_BINDINGS) as [Action, readonly string[]][]) {
@@ -173,6 +180,30 @@ export class Input {
     this.pendingLookDY += dy;
   }
 
+  /** Queue a one-frame edge-triggered press for a touch UI button (`interact`/`cameraToggle`/`horn`
+   *  only — the other actions are already level-driven via `virtual`). Consumed by the next `poll()`. */
+  pressVirtual(action: 'interact' | 'cameraToggle' | 'horn'): void {
+    this.virtualPress.add(action);
+  }
+
+  /** Drop every held key (and the smoothed steer that follows them). Used on window blur and when
+   *  the settings menu opens, so a key held at that moment is not still "down" on resume. */
+  clearKeys(): void {
+    this.keys.clear();
+    this.pressedThisFrame.clear();
+    this.keySteer = 0;
+  }
+
+  /** Exit pointer lock if currently held (used when the settings menu opens). No-op otherwise. */
+  releasePointerLock(): void {
+    if (!this.pointerLocked) return;
+    try {
+      document.exitPointerLock?.();
+    } catch {
+      /* ignore */
+    }
+  }
+
   /**
    * Compose the per-frame InputState from keyboard, gamepad and virtual inputs.
    * @param frameDelta seconds since last poll (for steer smoothing)
@@ -203,10 +234,10 @@ export class Input {
     s.sprint = this.isDown('sprint') || gp.sprint || this.virtual.sprint;
     s.jump = this.isDown('handbrake');
 
-    s.interactPressed = this.wasPressed('interact') || gp.interactPressed;
-    s.cameraTogglePressed = this.wasPressed('cameraToggle');
+    s.interactPressed = this.wasPressed('interact') || gp.interactPressed || this.virtualPress.has('interact');
+    s.cameraTogglePressed = this.wasPressed('cameraToggle') || this.virtualPress.has('cameraToggle');
     s.pausePressed = this.wasPressed('pause') || gp.pausePressed;
-    s.hornPressed = this.wasPressed('horn');
+    s.hornPressed = this.wasPressed('horn') || this.virtualPress.has('horn');
     s.lookBack = this.isDown('lookBack');
     s.qualityPressed = this.wasPressed('quality1') ? 1 : this.wasPressed('quality2') ? 2 : this.wasPressed('quality3') ? 3 : this.wasPressed('quality4') ? 4 : 0;
 
@@ -215,6 +246,7 @@ export class Input {
     this.pendingLookDX = 0;
     this.pendingLookDY = 0;
     this.pressedThisFrame.clear();
+    this.virtualPress.clear();
     return s;
   }
 
@@ -281,17 +313,43 @@ export class Input {
   }
 
   // --- DOM handlers --------------------------------------------------------
+  /**
+   * True when a keydown originates from a control inside an **open** settings menu — those events
+   * belong to the focused slider/select/checkbox/button (arrow keys nudge a range, Space toggles a
+   * checkbox, Enter activates a button) and must be left to the browser rather than being consumed
+   * as gameplay input.
+   *
+   * The match is deliberately anchored to `.settings-menu:not([hidden])` rather than to the
+   * element's tag name: Chromium keeps dispatching key events at the last focused element even
+   * after it has been hidden (`Menu.close()` sets `root.hidden`, and `document.activeElement`
+   * reports `<body>` while `e.target` is still the button that was clicked). A tag-based check
+   * therefore swallowed every gameplay key after the player closed the menu with the mouse, until
+   * they happened to click the canvas. Anything outside an open menu — the touch overlay's gear
+   * button included — is ordinary gameplay input.
+   */
+  private isUiTarget(target: EventTarget | null): boolean {
+    // Duck-typed rather than `instanceof HTMLElement` so this stays unit-testable with a plain
+    // mock in the (jsdom-less) node test environment; any real DOM element satisfies this too.
+    const el = target as { closest?: (selector: string) => unknown } | null;
+    if (!el || typeof el.closest !== 'function') return false;
+    return !!el.closest(OPEN_MENU_SELECTOR);
+  }
   private readonly onKeyDown = (e: KeyboardEvent) => {
     if (e.repeat) return;
+    // Escape/P stay live even inside the menu so it can always be closed from a focused control.
+    const isPauseKey = (KEY_BINDINGS.pause as readonly string[]).includes(e.code);
+    if (!isPauseKey && this.isUiTarget(e.target)) return;
     if (this.keyToActions.has(e.code)) e.preventDefault();
     this.setKey(e.code, true);
   };
+  /** Key releases are never filtered by target: a key pressed on the canvas and released while a
+   *  menu control has focus must still clear, or the car keeps accelerating with nothing held.
+   *  (Clearing a key is harmless for form controls, and keyup is never `preventDefault`ed.) */
   private readonly onKeyUp = (e: KeyboardEvent) => {
     this.setKey(e.code, false);
   };
   private readonly onBlur = () => {
-    this.keys.clear();
-    this.keySteer = 0;
+    this.clearKeys();
   };
   private readonly onMouseMove = (e: MouseEvent) => {
     if (!this.pointerLocked) return;

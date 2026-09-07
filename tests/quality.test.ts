@@ -1,12 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
   AdaptiveResolution,
+  DEFAULT_GAMEPLAY_SETTINGS,
   QUALITY_PRESETS,
   detectQualityPreset,
   getPreset,
+  isCustomQuality,
+  isGameplaySettingsKey,
+  isQualitySettingsKey,
+  loadSavedGameplay,
   loadSavedQuality,
+  nearestPreset,
   saveQuality,
   type DeviceInfo,
+  type GameplaySettings,
 } from '../src/core/Quality';
 
 const base: DeviceInfo = {
@@ -72,6 +79,155 @@ describe('quality presets', () => {
     expect(loaded?.shadowMapSize).toBe(2048);
     expect(loadSavedQuality({ getItem: () => 'not json' })).toBeNull();
     expect(loadSavedQuality(null)).toBeNull();
+  });
+});
+
+describe('isCustomQuality (settings menu custom badge)', () => {
+  it('is false for a preset object returned untouched from getPreset', () => {
+    for (const name of ['low', 'medium', 'high', 'ultra'] as const) {
+      expect(isCustomQuality(getPreset(name))).toBe(false);
+    }
+  });
+
+  it('is true once any single field diverges from its own named preset', () => {
+    const q = getPreset('high');
+    q.aa = 'fxaa';
+    expect(isCustomQuality(q)).toBe(true);
+    const q2 = getPreset('medium');
+    q2.shadowMapSize = 4096;
+    expect(isCustomQuality(q2)).toBe(true);
+    const q3 = getPreset('low');
+    q3.maxTraffic = 40;
+    expect(isCustomQuality(q3)).toBe(true);
+  });
+
+  it('is true whenever preset is already "custom" or an unknown name, even if the fields match a preset', () => {
+    const q = getPreset('medium');
+    q.preset = 'custom';
+    expect(isCustomQuality(q)).toBe(true);
+    const q2 = { ...getPreset('low'), preset: 'nonsense' } as unknown as ReturnType<typeof getPreset>;
+    expect(isCustomQuality(q2)).toBe(true);
+  });
+
+  it('reverting the only diverged field back to the preset value makes it non-custom again', () => {
+    const q = getPreset('ultra');
+    q.bloom = false;
+    expect(isCustomQuality(q)).toBe(true);
+    q.bloom = true;
+    expect(isCustomQuality(q)).toBe(false);
+  });
+});
+
+describe('isQualitySettingsKey / isGameplaySettingsKey (Menu.set routing)', () => {
+  it('recognises every QualitySettings field, including preset, and rejects gameplay/unknown keys', () => {
+    for (const k of Object.keys(getPreset('low'))) expect(isQualitySettingsKey(k)).toBe(true);
+    expect(isQualitySettingsKey('fov')).toBe(false);
+    expect(isQualitySettingsKey('notAField')).toBe(false);
+  });
+
+  it('recognises every GameplaySettings field and rejects quality/unknown keys', () => {
+    for (const k of Object.keys(DEFAULT_GAMEPLAY_SETTINGS)) expect(isGameplaySettingsKey(k)).toBe(true);
+    expect(isGameplaySettingsKey('aa')).toBe(false);
+    expect(isGameplaySettingsKey('notAField')).toBe(false);
+  });
+});
+
+describe('gameplay settings persistence (extends the quality record)', () => {
+  it('round-trips gameplay fields saved alongside quality, without disturbing quality fields', () => {
+    const store = new Map<string, string>();
+    const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
+    const q = getPreset('ultra');
+    q.aa = 'smaa';
+    const gameplay: GameplaySettings = { invertMouseY: true, fov: 78, daySpeed: 45, hudPerfOverlay: false };
+    saveQuality(storage, q, gameplay);
+
+    const loadedQuality = loadSavedQuality(storage);
+    expect(loadedQuality?.aa).toBe('smaa');
+    expect(loadedQuality?.shadowMapSize).toBe(4096); // untouched ultra field survives the merge
+
+    const loadedGameplay = loadSavedGameplay(storage);
+    expect(loadedGameplay).toEqual(gameplay);
+  });
+
+  it('falls back to defaults for a record saved without gameplay fields (pre-existing save)', () => {
+    const store = new Map<string, string>();
+    const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
+    saveQuality(storage, getPreset('medium')); // no gameplay argument, like the old call sites
+    expect(loadSavedGameplay(storage)).toEqual(DEFAULT_GAMEPLAY_SETTINGS);
+  });
+
+  it('falls back to defaults for missing storage, invalid JSON, or a wrong-typed field', () => {
+    expect(loadSavedGameplay(null)).toEqual(DEFAULT_GAMEPLAY_SETTINGS);
+    expect(loadSavedGameplay({ getItem: () => 'not json' })).toEqual(DEFAULT_GAMEPLAY_SETTINGS);
+    expect(loadSavedGameplay({ getItem: () => JSON.stringify({ fov: 'not a number', invertMouseY: true }) })).toEqual({
+      ...DEFAULT_GAMEPLAY_SETTINGS,
+      invertMouseY: true,
+    });
+  });
+
+  it('clamps a tampered/corrupt daySpeed and fov to the menu slider ranges instead of passing them through', () => {
+    // A daySpeed of 0 (or negative) would make TimeOfDay's hour accumulator divide-by-zero into
+    // NaN on the next advance() — only reachable via a hand-edited storage record or
+    // __gta7.menu.set('daySpeed', 0), since the slider itself clamps to [10, 300].
+    const loaded = loadSavedGameplay({ getItem: () => JSON.stringify({ daySpeed: 0, fov: -5 }) });
+    expect(loaded.daySpeed).toBeGreaterThanOrEqual(10);
+    expect(loaded.fov).toBeGreaterThanOrEqual(55);
+    expect(loaded.fov).toBeLessThanOrEqual(90);
+
+    const loadedHigh = loadSavedGameplay({ getItem: () => JSON.stringify({ daySpeed: 1e9, fov: 1e9 }) });
+    expect(loadedHigh.daySpeed).toBeLessThanOrEqual(300);
+    expect(loadedHigh.fov).toBeLessThanOrEqual(90);
+  });
+
+  it('loadSavedQuality does not leak gameplay fields into the returned QualitySettings', () => {
+    const store = new Map<string, string>();
+    const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
+    const gameplay: GameplaySettings = { invertMouseY: true, fov: 78, daySpeed: 45, hudPerfOverlay: false };
+    saveQuality(storage, getPreset('low'), gameplay);
+    const loaded = loadSavedQuality(storage);
+    expect(loaded).not.toBeNull();
+    for (const k of ['invertMouseY', 'fov', 'daySpeed', 'hudPerfOverlay']) {
+      expect(Object.prototype.hasOwnProperty.call(loaded, k)).toBe(false);
+    }
+  });
+});
+
+describe('nearestPreset', () => {
+  it('returns the preset itself when the settings still track one', () => {
+    for (const name of ['low', 'medium', 'high', 'ultra'] as const) {
+      expect(nearestPreset(getPreset(name))).toBe(name);
+    }
+  });
+
+  it('recovers the origin preset of a customised record (the saved record only says "custom")', () => {
+    // What a save looks like after the player nudged one knob: `preset` has become 'custom', so
+    // the menu's "Reset to preset" has nothing but the remaining fields to go on.
+    expect(nearestPreset({ ...getPreset('ultra'), preset: 'custom', maxTraffic: 0 })).toBe('ultra');
+    expect(nearestPreset({ ...getPreset('low'), preset: 'custom', aa: 'none', bloom: true })).toBe('low');
+    expect(nearestPreset({ ...getPreset('high'), preset: 'custom', renderScale: 1.5 })).toBe('high');
+    expect(nearestPreset({ ...getPreset('medium'), preset: 'custom', shadowDistance: 200 })).toBe('medium');
+  });
+
+  it('is stable under the `?q.*` URL overrides that never recorded an origin preset at all', () => {
+    // main.ts seeds `?q.*` overrides from medium and stamps preset:'custom'.
+    expect(nearestPreset({ ...getPreset('medium'), preset: 'custom', aa: 'none', shadowMapSize: 512 })).toBe('medium');
+  });
+
+  it('breaks a tie toward the cheaper preset rather than guessing upward', () => {
+    // Build a record exactly midway between low and medium: take low, then flip half of the fields
+    // in which the two presets disagree over to medium's values. Its distance to low (the number of
+    // flipped fields) is then <= its distance to medium (the number left), so the cheaper preset
+    // must win — a "reset to preset" that silently upgraded the player's settings would be worse
+    // than one that downgrades them.
+    const differing = (Object.keys(QUALITY_PRESETS.low) as (keyof typeof QUALITY_PRESETS.low)[]).filter(
+      (k) => k !== 'preset' && QUALITY_PRESETS.low[k] !== QUALITY_PRESETS.medium[k],
+    );
+    expect(differing.length).toBeGreaterThan(4); // sanity: the two presets really do differ
+    const mixed = { ...getPreset('low'), preset: 'custom' as const };
+    for (const k of differing.slice(0, Math.floor(differing.length / 2))) {
+      (mixed as unknown as Record<string, unknown>)[k] = QUALITY_PRESETS.medium[k];
+    }
+    expect(nearestPreset(mixed)).toBe('low');
   });
 });
 

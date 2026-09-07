@@ -8,7 +8,16 @@ import { PoliceSystem, RAM_STOP_GAP, type PoliceFocus } from '../ai/Police';
 import { Engine } from '../core/Engine';
 import { EventBus } from '../core/EventBus';
 import { Input } from '../core/Input';
-import { detectQualityPreset, getPreset, isPresetName, saveQuality, type QualityPresetName, type QualitySettings } from '../core/Quality';
+import {
+  detectQualityPreset,
+  getPreset,
+  isPresetName,
+  loadSavedGameplay,
+  saveQuality,
+  type GameplaySettings,
+  type QualityPresetName,
+  type QualitySettings,
+} from '../core/Quality';
 import { CameraRig } from '../entities/CameraRig';
 import { PlayerEntity } from '../entities/PlayerEntity';
 import { VehicleEntity } from '../entities/VehicleEntity';
@@ -22,7 +31,9 @@ import { LocalLights, type LampPoint } from '../render/LocalLights';
 import { MaterialRegistry } from '../render/MaterialRegistry';
 import { SkyDome } from '../render/SkyDome';
 import { HUD } from '../ui/HUD';
+import { Menu } from '../ui/Menu';
 import { Minimap } from '../ui/Minimap';
+import { TouchControls, isTouchDevice } from '../ui/TouchControls';
 import { Random } from '../world/Random';
 import { buildCity, type CityView } from '../world/CityBuilder';
 import { buildingAABBs, generateCity, lampHeadPosition, lanePoint, type CityData, type CityParams } from '../world/CityGenerator';
@@ -31,7 +42,6 @@ import {
   daylightFactor,
   moonDirection,
   sunAngles,
-  DEFAULT_SECONDS_PER_GAME_HOUR,
   ENV_REGEN_THRESHOLD_DEG,
   TIME_UPDATE_MIN_GAME_HOURS,
   TimeOfDay,
@@ -51,6 +61,9 @@ export interface GameOptions {
   /** Real seconds per in-game hour (default 90 — a full day every 36 real minutes). */
   secondsPerGameHour?: number;
   storage?: Storage | null;
+  /** Show the on-screen touch overlay (left joystick, right buttons, gear button). Defaults to an
+   *  actual touch-capability probe (`isTouchDevice()`) so it "just works" on phones/tablets. */
+  touch?: boolean;
 }
 
 export type PlayerMode = 'foot' | 'vehicle';
@@ -116,6 +129,10 @@ export class Game {
   readonly city: CityData;
   readonly grid: StaticColliderGrid;
   readonly hud: HUD;
+  readonly menu: Menu;
+  readonly touch: TouchControls | null;
+  /** Non-quality settings (FOV, mouse-Y invert, day speed, HUD perf overlay) — see `Quality.ts`. */
+  gameplay: GameplaySettings;
   readonly player: PlayerEntity;
   readonly vehicles: VehicleEntity[] = [];
   /**
@@ -205,24 +222,38 @@ export class Game {
   private readonly storage: Storage | null;
   private readonly dpr: number;
   private hint = '';
+  /** Day speed as loaded from storage while a `?dayspeed=` URL override is shadowing it in
+   *  `gameplay`; `null` once there is no override (or the player has changed the slider). */
+  private storedDaySpeed: number | null = null;
   /** Deterministic RNG for vehicle-type/paint choices, seeded from the city seed. */
   private readonly vehicleRng: Random;
 
   constructor(private readonly opts: GameOptions) {
     this.storage = opts.storage ?? null;
     this.dpr = opts.devicePixelRatio ?? 1;
+    this.gameplay = loadSavedGameplay(this.storage);
+    // A `?dayspeed=` URL override takes effect on the clock below; mirror it into `gameplay` too so
+    // the menu's "Day length" slider reflects the clock actually running, rather than the
+    // saved/default value the URL just overrode. It is a session-only override though (same as
+    // `?quality=`), so remember what was stored: every later `saveQuality` writes that back
+    // instead, and the URL value — which may be far outside the slider's 10..300 s range — never
+    // reaches storage to be silently clamped into a different day length on the next load.
+    if (opts.secondsPerGameHour !== undefined) {
+      this.storedDaySpeed = this.gameplay.daySpeed;
+      this.gameplay = { ...this.gameplay, daySpeed: opts.secondsPerGameHour };
+    }
     const provisional = opts.quality === 'auto' ? getPreset('medium') : opts.quality;
     this.gfx = new GameRenderer(opts.canvas, provisional, this.dpr);
     this.quality = opts.quality === 'auto' ? getPreset(detectQualityPreset(this.gfx.deviceInfo)) : opts.quality;
 
-    this.camera = new PerspectiveCamera(62, 16 / 9, 0.3, this.quality.farDistance + 800);
+    this.camera = new PerspectiveCamera(this.gameplay.fov, 16 / 9, 0.3, this.quality.farDistance + 800);
     this.scene.add(this.camera);
     this.sky = new SkyDome(this.gfx.renderer);
     this.scene.add(this.sky.sky);
     this.scene.add(this.sky.stars);
     this.lighting = new Lighting(this.scene, this.camera, this.registry, this.quality);
     this.localLights = new LocalLights(this.scene, this.quality);
-    this.clock = new TimeOfDay(opts.timeOfDay ?? 14, opts.secondsPerGameHour ?? DEFAULT_SECONDS_PER_GAME_HOUR);
+    this.clock = new TimeOfDay(opts.timeOfDay ?? 14, opts.secondsPerGameHour ?? this.gameplay.daySpeed);
     this.lastAppliedHours = this.clock.hours;
     this.headlightL.target = this.headlightTargetL;
     this.headlightR.target = this.headlightTargetR;
@@ -247,6 +278,7 @@ export class Game {
     this.scene.add(this.cityView.root);
 
     this.hud = new HUD(opts.hudContainer);
+    this.hud.setPerfOverlayVisible(this.gameplay.hudPerfOverlay);
 
     // Player starts on foot beside a parked car at the spawn point.
     const spawn = this.city.spawn;
@@ -269,7 +301,31 @@ export class Game {
     this.events.on('policeContact', () => (this.wanted = addWantedHeat(this.wanted, 'policeContact')));
 
     this.cameraRig = new CameraRig(this.camera, this.grid);
+    this.cameraRig.baseFov = this.gameplay.fov;
     this.cameraRig.snapTo(this.cameraTarget());
+
+    this.menu = new Menu(opts.hudContainer, {
+      getQuality: () => this.quality,
+      getGameplay: () => this.gameplay,
+      getTimeOfDay: () => this.clock.hours,
+      onOpenChange: (open) => {
+        this.paused = open;
+        if (open) {
+          // Any key held at the moment the menu opens would otherwise still read as held on
+          // resume (its keyup lands on a menu control, or never arrives at all).
+          this.input.clearKeys();
+          this.input.releasePointerLock();
+        }
+      },
+      onPreset: (name) => this.setQualityPreset(name),
+      onQualityChange: (patch) => this.applyQuality({ ...this.quality, ...patch }),
+      onGameplayChange: (patch) => this.applyGameplaySettings({ ...this.gameplay, ...patch }),
+      onTimeOfDay: (hours) => this.setTimeOfDay(hours),
+      onRestart: () => this.respawn(),
+      getStats: () => ({ frame: this.engine.stats.frame, drawCalls: this.gfx.stats().drawCalls }),
+    });
+    const showTouch = opts.touch ?? isTouchDevice();
+    this.touch = showTouch ? new TouchControls(opts.canvas, opts.hudContainer, this.input, () => this.menu.open()) : null;
 
     this.gfx.applyQuality(this.quality, this.scene, this.camera, this.dpr);
     this.applyTimeOfDay(true);
@@ -328,9 +384,41 @@ export class Game {
     this.pedestrians.rebuild(q, this.trafficFocus());
     this.applyTimeOfDay(true);
     this.syncHeadlights();
-    saveQuality(this.storage, q);
+    saveQuality(this.storage, q, this.gameplayForStorage());
     this.hud.showToast(`Quality: ${q.preset}`);
     this.updateHint();
+  }
+
+  // --- gameplay settings -------------------------------------------------------
+  /** Apply and persist gameplay settings (FOV, mouse-Y invert, day speed, HUD perf overlay) — the
+   *  "Gameplay" section of the settings menu. Cheap (no GPU rebuild), unlike `applyQuality`. */
+  applyGameplaySettings(g: GameplaySettings): void {
+    // The player moving the "Day length" slider takes ownership of it back from `?dayspeed=`.
+    if (this.storedDaySpeed !== null && g.daySpeed !== this.gameplay.daySpeed) this.storedDaySpeed = null;
+    this.gameplay = g;
+    this.cameraRig.baseFov = g.fov;
+    // Defense in depth against a non-positive daySpeed reaching the clock (e.g. via
+    // `__gta7.menu.set('daySpeed', 0)`, which bypasses the slider's min) — TimeOfDay divides by
+    // this every `advance()`, and 0 (or negative) turns `hours` into NaN within a frame.
+    this.clock.secondsPerGameHour = Math.max(0.01, g.daySpeed);
+    this.hud.setPerfOverlayVisible(g.hudPerfOverlay);
+    saveQuality(this.storage, this.quality, this.gameplayForStorage());
+  }
+
+  /** The gameplay settings as they should be *persisted*: identical to `this.gameplay` except that
+   *  a session-only `?dayspeed=` override is swapped back for the stored value it shadowed. */
+  private gameplayForStorage(): GameplaySettings {
+    return this.storedDaySpeed !== null ? { ...this.gameplay, daySpeed: this.storedDaySpeed } : this.gameplay;
+  }
+
+  /** Reset the player to the city spawn on foot, exit any vehicle, clear the wanted level and
+   *  despawn police — the settings menu's "Restart game" button. Does not touch quality/gameplay
+   *  settings or regenerate the city. */
+  respawn(): void {
+    this.busted = false;
+    this.bustedOverlayTimer = 0;
+    this.resetToSpawn();
+    this.hud.showToast('Restarted');
   }
 
   // --- time of day -----------------------------------------------------------
@@ -446,8 +534,12 @@ export class Game {
   // --- simulation ---------------------------------------------------------------
   private update(dt: number): void {
     const inp = this.input.poll(dt);
-    if (inp.pausePressed) this.paused = !this.paused;
-    if (inp.qualityPressed) {
+    if (inp.pausePressed) this.menu.toggle();
+    // Quality hotkeys are gameplay keys too: applying a preset behind the open menu would leave
+    // its preset buttons/knobs showing stale values. (Input.ts already stops the 1-4 codes from
+    // reaching here while a control *inside the open menu* has focus, but they still arrive when
+    // nothing in the menu has focus — e.g. right after opening it with Escape.)
+    if (inp.qualityPressed && !this.paused) {
       const name = (['low', 'medium', 'high', 'ultra'] as const)[inp.qualityPressed - 1];
       if (name && isPresetName(name) && name !== this.quality.preset) this.setQualityPreset(name);
     }
@@ -610,6 +702,13 @@ export class Game {
   private triggerBusted(): void {
     this.busted = true;
     this.bustedOverlayTimer = BUSTED_OVERLAY_TIME;
+    this.resetToSpawn();
+  }
+
+  /** Exit any vehicle, teleport the player back to the city spawn on foot, and clear the wanted
+   *  level + despawn police. Shared by `triggerBusted` (caught by police) and `respawn` (the
+   *  settings menu's "Restart game" button) — the only difference is who else it resets. */
+  private resetToSpawn(): void {
     this.bustedContactTimer = 0;
     if (this.mode === 'vehicle' && this.currentVehicle) {
       this.currentVehicle.driven = false;
@@ -725,7 +824,11 @@ export class Game {
     this.player.syncVisual(alpha);
     const target = this.cameraTarget();
     const s = this.input.state;
-    this.cameraRig.update(target, frameDelta, s.lookDX, s.lookDY, s.lookBack);
+    const lookDY = this.gameplay.invertMouseY ? -s.lookDY : s.lookDY;
+    this.cameraRig.update(target, frameDelta, s.lookDX, lookDY, s.lookBack);
+    // The settings menu's debounced knobs (and its benchmark) run off real frame time, independent
+    // of `paused` — the menu is only interactive while paused, so it must keep ticking then.
+    this.menu.tick(frameDelta);
     this.camera.updateMatrixWorld();
     this.focus.copy(target.position);
     this.lighting.update(this.focus);
@@ -832,6 +935,8 @@ export class Game {
     this.lighting.dispose();
     this.sky.dispose();
     this.hud.dispose();
+    this.menu.dispose();
+    this.touch?.dispose();
     this.minimap.dispose();
     this.gfx.dispose();
   }

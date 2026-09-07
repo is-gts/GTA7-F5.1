@@ -18,7 +18,15 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { FXAAPass } from 'three/addons/postprocessing/FXAAPass.js';
 import type { Pass } from 'three/addons/postprocessing/Pass.js';
-import type { QualitySettings } from '../core/Quality';
+import type { AAMode, QualitySettings } from '../core/Quality';
+
+/**
+ * AA modes this pipeline actually implements (see the branches below). `'taa'` is a valid
+ * `QualitySettings.aa` value reserved for a future task; until it lands here, `Menu` uses this list
+ * to keep it out of the settings dropdown ("AA mode select ... taa when available") instead of
+ * offering a mode that silently falls back to no post-tonemap AA.
+ */
+export const AVAILABLE_AA_MODES: readonly AAMode[] = ['none', 'fxaa', 'smaa', 'msaa', 'ssaa'];
 
 export interface PipelineInfo {
   aa: QualitySettings['aa'];

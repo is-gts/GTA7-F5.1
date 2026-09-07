@@ -2,6 +2,7 @@ import './style.css';
 import { Game } from './game/Game';
 import { QUALITY_PRESETS, getPreset, isPresetName, loadSavedQuality } from './core/Quality';
 import type { QualityPresetName, QualitySettings } from './core/Quality';
+import { isTouchDevice } from './ui/TouchControls';
 
 const canvas = document.getElementById('game') as HTMLCanvasElement | null;
 const hudContainer = document.getElementById('hud');
@@ -16,8 +17,9 @@ const storage = (() => {
   }
 })();
 
+const savedQuality = loadSavedQuality(storage);
 const qualityParam = params.get('quality');
-let quality: QualitySettings | 'auto' = isPresetName(qualityParam) ? getPreset(qualityParam) : (loadSavedQuality(storage) ?? 'auto');
+let quality: QualitySettings | 'auto' = isPresetName(qualityParam) ? getPreset(qualityParam) : (savedQuality ?? 'auto');
 // Individual overrides for benchmarking / debugging: ?q.aa=none&q.shadowMapSize=1024&q.bloom=false
 for (const [k, v] of params.entries()) {
   if (!k.startsWith('q.')) continue;
@@ -26,6 +28,16 @@ for (const [k, v] of params.entries()) {
   const parsed: unknown = v === 'true' ? true : v === 'false' ? false : v !== '' && !Number.isNaN(Number(v)) ? Number(v) : v;
   (quality as unknown as Record<string, unknown>)[key] = parsed;
   quality.preset = 'custom';
+}
+// Mobile defaults: an untouched touch device (no explicit ?quality=, no ?q.* override, no saved
+// settings) starts on `low` with capped pixel ratio and adaptive resolution on, rather than
+// whatever `detectQualityPreset` would otherwise guess from the (often generic) touch GPU string.
+const touchParam = params.get('touch');
+const touchDetected = touchParam === '1' || isTouchDevice();
+if (quality === 'auto' && touchDetected && !savedQuality) {
+  quality = getPreset('low');
+  quality.maxPixelRatio = 1;
+  quality.adaptiveResolution = true;
 }
 const seed = Number(params.get('seed') ?? '7');
 const cols = params.get('cols');
@@ -47,6 +59,7 @@ const game = new Game({
   timeOfDay: tod ? Number(tod) : 14,
   ...(dayspeed ? { secondsPerGameHour: Math.max(0.01, Number(dayspeed)) } : {}),
   storage,
+  touch: touchDetected,
 });
 
 const resize = () => game.resize(window.innerWidth, window.innerHeight);
@@ -69,6 +82,13 @@ const api = {
   setQuality: (name: QualityPresetName) => game.setQualityPreset(name),
   setKey: (code: string, down: boolean) => game.input.setKey(code, down),
   setTimeOfDay: (h: number) => game.setTimeOfDay(h),
+  /** `window.__gta7.menu` — settings-menu automation hooks for e2e tests. */
+  menu: {
+    open: () => game.menu.open(),
+    close: () => game.menu.close(),
+    isOpen: () => game.menu.isOpen,
+    set: (key: string, value: unknown) => game.menu.set(key, value),
+  },
   snapshot: () => {
     const v = game.currentVehicle;
     const p = game.player.state;
@@ -94,6 +114,10 @@ const api = {
       time: game.currentTimeOfDay,
       envRegens: game.envRegens,
       localLights: { active: game.localLights.active, max: game.quality.maxLocalLights },
+      menuOpen: game.menu.isOpen,
+      gameplay: game.gameplay,
+      input: { virtual: { ...game.input.virtual } },
+      touch: game.touch !== null,
     };
   },
   /** Render a frame and sample the default framebuffer: mean/variance of luminance over a grid. */

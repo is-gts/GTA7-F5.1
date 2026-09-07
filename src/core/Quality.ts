@@ -4,6 +4,10 @@
  * Every expensive rendering feature is driven from a `QualitySettings` object so the game can
  * scale from integrated/mobile GPUs ("low") to discrete GPUs ("ultra").
  */
+function clamp(v: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, v));
+}
+
 export type AAMode = 'none' | 'fxaa' | 'smaa' | 'msaa' | 'ssaa' | 'taa';
 export type AOMode = 'none' | 'ssao' | 'gtao';
 export type ShadowMode = 'none' | 'single' | 'csm';
@@ -179,6 +183,9 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
   },
 };
 
+/** Presets cheapest-first (also the tie-break order used by `nearestPreset`). */
+export const PRESET_ORDER: readonly QualityPresetName[] = ['low', 'medium', 'high', 'ultra'];
+
 export function getPreset(name: QualityPresetName): QualitySettings {
   return { ...QUALITY_PRESETS[name] };
 }
@@ -230,23 +237,142 @@ export function loadSavedQuality(storage: Pick<Storage, 'getItem'> | null): Qual
     const parsed = JSON.parse(raw) as Partial<QualitySettings>;
     if (typeof parsed !== 'object' || parsed === null) return null;
     const base = getPreset(isPresetName(parsed.preset) ? parsed.preset : 'medium');
-    return { ...base, ...parsed };
+    // Only copy keys that actually belong to `QualitySettings` — the storage record is a flat
+    // merge with `GameplaySettings` (see `saveQuality`), so a naive `{ ...base, ...parsed }` would
+    // also pull in invertMouseY/fov/daySpeed/hudPerfOverlay and pollute the returned object.
+    const out: QualitySettings = { ...base };
+    for (const k of Object.keys(base) as (keyof QualitySettings)[]) {
+      if (parsed[k] !== undefined) (out as unknown as Record<string, unknown>)[k] = parsed[k];
+    }
+    return out;
   } catch {
     return null;
   }
 }
 
-export function saveQuality(storage: Pick<Storage, 'setItem'> | null, q: QualitySettings): void {
+/**
+ * Persist quality (and, when given, gameplay) settings under one storage record — a flat merge, so
+ * `loadSavedQuality`/`loadSavedGameplay` can each read back just the slice they know about (and
+ * old records without gameplay fields still load fine, via `DEFAULT_GAMEPLAY_SETTINGS`).
+ */
+export function saveQuality(storage: Pick<Storage, 'setItem'> | null, q: QualitySettings, gameplay?: GameplaySettings): void {
   if (!storage) return;
   try {
-    storage.setItem(STORAGE_KEY, JSON.stringify(q));
+    storage.setItem(STORAGE_KEY, JSON.stringify(gameplay ? { ...q, ...gameplay } : q));
   } catch {
     /* quota / private mode: ignore */
   }
 }
 
+/** Read back the gameplay half of a record saved by `saveQuality`, defaulting any missing/invalid
+ *  field (including a record saved before gameplay settings existed) to `DEFAULT_GAMEPLAY_SETTINGS`. */
+export function loadSavedGameplay(storage: Pick<Storage, 'getItem'> | null): GameplaySettings {
+  if (!storage) return { ...DEFAULT_GAMEPLAY_SETTINGS };
+  try {
+    const raw = storage.getItem(STORAGE_KEY);
+    if (!raw) return { ...DEFAULT_GAMEPLAY_SETTINGS };
+    const parsed = JSON.parse(raw) as Partial<GameplaySettings>;
+    if (typeof parsed !== 'object' || parsed === null) return { ...DEFAULT_GAMEPLAY_SETTINGS };
+    return {
+      invertMouseY: typeof parsed.invertMouseY === 'boolean' ? parsed.invertMouseY : DEFAULT_GAMEPLAY_SETTINGS.invertMouseY,
+      // Clamped to the settings menu's own slider ranges: a corrupted/tampered record (or
+      // `__gta7.menu.set('daySpeed', 0)`) must not be able to smuggle in a non-positive daySpeed
+      // (which drives TimeOfDay's hour accumulator to NaN) or an absurd FOV.
+      fov: typeof parsed.fov === 'number' && Number.isFinite(parsed.fov) ? clamp(parsed.fov, 55, 90) : DEFAULT_GAMEPLAY_SETTINGS.fov,
+      daySpeed: typeof parsed.daySpeed === 'number' && Number.isFinite(parsed.daySpeed) ? clamp(parsed.daySpeed, 10, 300) : DEFAULT_GAMEPLAY_SETTINGS.daySpeed,
+      hudPerfOverlay: typeof parsed.hudPerfOverlay === 'boolean' ? parsed.hudPerfOverlay : DEFAULT_GAMEPLAY_SETTINGS.hudPerfOverlay,
+    };
+  } catch {
+    return { ...DEFAULT_GAMEPLAY_SETTINGS };
+  }
+}
+
 export function isPresetName(v: unknown): v is QualityPresetName {
   return v === 'low' || v === 'medium' || v === 'high' || v === 'ultra';
+}
+
+const QUALITY_KEYS = new Set<string>(Object.keys(QUALITY_PRESETS.low));
+
+/** True when `k` names a field of `QualitySettings` (used by the settings menu to route a generic
+ *  `set(key, value)` call to either the quality patch or the gameplay patch). */
+export function isQualitySettingsKey(k: string): k is keyof QualitySettings {
+  return QUALITY_KEYS.has(k);
+}
+
+/**
+ * True when `q` differs from its own named preset in any field but `preset` itself (or when
+ * `preset` is already `'custom'` / not a known preset name) — i.e. whether the settings menu
+ * should show the "custom" badge instead of highlighting a single preset button. Pure and cheap
+ * (one shallow scan of the preset's own keys), so it can run on every settings-menu refresh.
+ */
+export function isCustomQuality(q: QualitySettings): boolean {
+  if (!isPresetName(q.preset)) return true;
+  const preset = QUALITY_PRESETS[q.preset];
+  for (const k of Object.keys(preset) as (keyof QualitySettings)[]) {
+    if (k === 'preset') continue;
+    if (q[k] !== preset[k]) return true;
+  }
+  return false;
+}
+
+/**
+ * The preset a (possibly customised) settings object most closely resembles: `q.preset` itself when
+ * it still names a preset, otherwise the preset differing in the fewest fields (ties break toward
+ * the cheaper preset, since `PRESET_ORDER` runs low → ultra).
+ *
+ * The persisted record only stores `preset: 'custom'` once any knob diverges, so the origin preset
+ * has to be recovered this way for the settings menu's "Reset to preset" button after a reload (or
+ * after `?q.*=` URL overrides, which never had an origin preset recorded at all). Pure and cheap
+ * (four shallow scans), so it can run at menu construction without ceremony.
+ */
+export function nearestPreset(q: QualitySettings): QualityPresetName {
+  if (isPresetName(q.preset)) return q.preset;
+  let best: QualityPresetName = 'medium';
+  let bestDiff = Infinity;
+  for (const name of PRESET_ORDER) {
+    const preset = QUALITY_PRESETS[name];
+    let diff = 0;
+    for (const k of Object.keys(preset) as (keyof QualitySettings)[]) {
+      if (k === 'preset') continue;
+      if (q[k] !== preset[k]) diff++;
+    }
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = name;
+    }
+  }
+  return best;
+}
+
+/**
+ * Non-quality, gameplay-facing settings shown in the same pause menu and persisted alongside
+ * `QualitySettings` (see `saveQuality`/`loadSavedGameplay`) — camera FOV, mouse-Y inversion, the
+ * day/night clock's speed, and whether the HUD's performance line is drawn.
+ */
+export interface GameplaySettings {
+  /** Mouse-look Y axis inverted (touch look is unaffected — it has its own natural drag feel). */
+  invertMouseY: boolean;
+  /** Base vertical field of view in degrees (55..90); `CameraRig` adds a small speed-based boost
+   *  on top of this while driving. */
+  fov: number;
+  /** Real seconds per in-game hour — see `TimeOfDay`. Smaller is a faster day/night cycle. */
+  daySpeed: number;
+  /** Whether the HUD's performance line (fps/ms/draw calls/...) is drawn. */
+  hudPerfOverlay: boolean;
+}
+
+export const DEFAULT_GAMEPLAY_SETTINGS: GameplaySettings = {
+  invertMouseY: false,
+  fov: 62,
+  daySpeed: 90,
+  hudPerfOverlay: true,
+};
+
+const GAMEPLAY_KEYS = new Set<string>(Object.keys(DEFAULT_GAMEPLAY_SETTINGS));
+
+/** True when `k` names a field of `GameplaySettings`. */
+export function isGameplaySettingsKey(k: string): k is keyof GameplaySettings {
+  return GAMEPLAY_KEYS.has(k);
 }
 
 /**

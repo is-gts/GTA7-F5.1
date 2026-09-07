@@ -82,6 +82,12 @@ export class HUD {
     }
   }
 
+  /** Show/hide the performance line (fps/ms/draw calls/...) — the "HUD performance overlay" toggle
+   *  in the settings menu. Speed/hint/wanted/busted stay visible either way. */
+  setPerfOverlayVisible(visible: boolean): void {
+    this.perf.hidden = !visible;
+  }
+
   showToast(text: string, ms = 2200): void {
     this.toast.textContent = text;
     this.toast.hidden = false;
