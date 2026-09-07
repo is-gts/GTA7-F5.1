@@ -148,7 +148,7 @@ test.describe('GTA7 smoke', () => {
     const setQuality = (name: string) => page.evaluate((n) => (window as unknown as { __gta7: { setQuality(n: string): void } }).__gta7.setQuality(n), name);
     for (const [name, aa, ao, shadows] of [
       ['ultra', 'msaa', 'gtao', 'csm'],
-      ['high', 'smaa', 'gtao', 'csm'],
+      ['high', 'taa', 'gtao', 'csm'],
       ['medium', 'smaa', 'none', 'csm'],
       ['low', 'fxaa', 'none', 'single'],
     ] as const) {

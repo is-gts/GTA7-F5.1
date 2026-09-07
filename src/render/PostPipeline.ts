@@ -7,7 +7,7 @@
  *     → OutputPass (tone mapping + sRGB)
  *     → SMAA 1x or FXAA (post-tonemap edge AA, complements/replaces MSAA)
  */
-import { HalfFloatType, Vector2, WebGLRenderTarget, type Camera, type Scene, type WebGLRenderer } from 'three';
+import { HalfFloatType, Vector2, WebGLRenderTarget, type PerspectiveCamera, type Scene, type WebGLRenderer } from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { SSAARenderPass } from 'three/addons/postprocessing/SSAARenderPass.js';
@@ -19,14 +19,10 @@ import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { FXAAPass } from 'three/addons/postprocessing/FXAAPass.js';
 import type { Pass } from 'three/addons/postprocessing/Pass.js';
 import type { AAMode, QualitySettings } from '../core/Quality';
+import { TAAPass } from './TAAPass';
 
-/**
- * AA modes this pipeline actually implements (see the branches below). `'taa'` is a valid
- * `QualitySettings.aa` value reserved for a future task; until it lands here, `Menu` uses this list
- * to keep it out of the settings dropdown ("AA mode select ... taa when available") instead of
- * offering a mode that silently falls back to no post-tonemap AA.
- */
-export const AVAILABLE_AA_MODES: readonly AAMode[] = ['none', 'fxaa', 'smaa', 'msaa', 'ssaa'];
+/** AA modes this pipeline implements (drives the settings-menu dropdown, see `Menu.ts`). */
+export const AVAILABLE_AA_MODES: readonly AAMode[] = ['none', 'fxaa', 'smaa', 'msaa', 'ssaa', 'taa'];
 
 export interface PipelineInfo {
   aa: QualitySettings['aa'];
@@ -34,6 +30,9 @@ export interface PipelineInfo {
   ao: QualitySettings['ao'];
   bloom: boolean;
   passes: string[];
+  /** Halton sample index (0..sampleCount-1) the TAA pass used for the last-rendered frame; 0 when
+   *  `aa !== 'taa'`. Updated every `render()` call — see `TAAPass.jitterIndex`. */
+  taaJitterIndex: number;
 }
 
 export class PostPipeline {
@@ -43,12 +42,13 @@ export class PostPipeline {
   private readonly gtao: GTAOPass | null = null;
   private readonly ssao: SSAOPass | null = null;
   private readonly bloom: UnrealBloomPass | null = null;
+  private readonly taa: TAAPass | null = null;
   private readonly aoScale: number;
 
   constructor(
     renderer: WebGLRenderer,
     scene: Scene,
-    camera: Camera,
+    camera: PerspectiveCamera,
     q: QualitySettings,
     width: number,
     height: number,
@@ -70,6 +70,12 @@ export class PostPipeline {
       ssaa.sampleLevel = 2; // 4 jittered samples
       ssaa.unbiased = true;
       this.add(ssaa, 'ssaa');
+    } else if (q.aa === 'taa') {
+      const taa = new TAAPass(scene, camera, Math.max(1, Math.floor(width * pr)), Math.max(1, Math.floor(height * pr)), {
+        blend: q.taaBlend,
+      });
+      this.taa = taa;
+      this.add(taa, 'taa');
     } else {
       this.add(new RenderPass(scene, camera), 'render');
     }
@@ -117,6 +123,7 @@ export class PostPipeline {
       ao: q.ao,
       bloom: q.bloom,
       passes: this.passes.map((p) => (p as Pass & { __name?: string }).__name ?? p.constructor.name),
+      taaJitterIndex: 0,
     };
     this.setSize(width, height);
   }
@@ -141,6 +148,7 @@ export class PostPipeline {
 
   render(deltaTime: number): void {
     this.composer.render(deltaTime);
+    if (this.taa) this.info.taaJitterIndex = this.taa.jitterIndex;
   }
 
   setBloomStrength(strength: number): void {

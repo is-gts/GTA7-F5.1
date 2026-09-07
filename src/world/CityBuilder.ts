@@ -253,14 +253,49 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
   const grass = createGrassMap(texSize / 2, aniso, p.seed + 4);
   disposables.push(roadMaps.map, roadMaps.normalMap, roadMaps.roughnessMap, asphaltMaps.map, asphaltMaps.normalMap, asphaltMaps.roughnessMap, concrete.map, concrete.normalMap, grass);
 
+  // The road/crossing meshes sit only 2 cm above the ground plane (see `y` below) — plenty under
+  // a fixed, unperturbed camera (the depth test is deterministic frame to frame), but `aa: 'taa'`
+  // deliberately perturbs the projection matrix by a sub-pixel amount every frame (see
+  // `render/TAAPass.ts`), which is enough to flip which surface wins that near-coincident depth
+  // test from one frame to the next — a visible road/ground z-fight flicker. `polygonOffset`
+  // biases the road's depth value toward the camera in a way that's independent of camera jitter,
+  // so it stays robust to TAA (and is free — a rasterizer-stage bias, not a shading cost).
   const roadMat = registry.register(
-    new MeshStandardMaterial({ map: roadMaps.map, normalMap: roadMaps.normalMap, roughnessMap: roadMaps.roughnessMap, roughness: 1, metalness: 0, envMapIntensity: quality.envReflections ? 0.5 : 0 }),
+    new MeshStandardMaterial({
+      map: roadMaps.map,
+      normalMap: roadMaps.normalMap,
+      roughnessMap: roadMaps.roughnessMap,
+      roughness: 1,
+      metalness: 0,
+      envMapIntensity: quality.envReflections ? 0.5 : 0,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+    }),
   );
   const asphaltMat = registry.register(
-    new MeshStandardMaterial({ map: asphaltMaps.map, normalMap: asphaltMaps.normalMap, roughnessMap: asphaltMaps.roughnessMap, roughness: 1, metalness: 0, envMapIntensity: quality.envReflections ? 0.5 : 0 }),
+    new MeshStandardMaterial({
+      map: asphaltMaps.map,
+      normalMap: asphaltMaps.normalMap,
+      roughnessMap: asphaltMaps.roughnessMap,
+      roughness: 1,
+      metalness: 0,
+      envMapIntensity: quality.envReflections ? 0.5 : 0,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+    }),
   );
-  const concreteMat = registry.register(new MeshStandardMaterial({ map: concrete.map, normalMap: concrete.normalMap, roughness: 0.9, metalness: 0 }));
-  const grassMat = registry.register(new MeshStandardMaterial({ map: grass, roughness: 1, metalness: 0 }));
+  // Same near-coincident-depth reasoning as roadMat/asphaltMat above: the inner-block concrete/
+  // park-grass decal quads sit only 0.5-1 cm above the sidewalk boxes they're merged with (or the
+  // ground plane, at parks), which is equally exposed to TAA's per-frame jitter flipping the depth
+  // test. Both materials get the same defensive bias.
+  const concreteMat = registry.register(
+    new MeshStandardMaterial({ map: concrete.map, normalMap: concrete.normalMap, roughness: 0.9, metalness: 0, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }),
+  );
+  const grassMat = registry.register(
+    new MeshStandardMaterial({ map: grass, roughness: 1, metalness: 0, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }),
+  );
   const lampMetal = registry.register(new MeshStandardMaterial({ color: 0x55585c, roughness: 0.5, metalness: 0.8 }));
   const lampHead = registry.register(new MeshStandardMaterial({ color: 0xfff2d0, emissive: new Color(0xffd28a), emissiveIntensity: 0, roughness: 0.4 }));
   nightMaterials.push({ mat: lampHead, day: 0, night: 6 });

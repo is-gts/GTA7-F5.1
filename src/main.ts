@@ -162,5 +162,24 @@ const api = {
     }
     return { width: w, height: h, mean, variance: sum2 / n - mean * mean, darkFraction: dark / n, samples: rows, maxLuminance, brightCount };
   },
+  /** Render a frame and return the full-width, full-precision luminance profile of one row of the
+   *  framebuffer (`yFraction` 0..1 from the top) — used by the TAA e2e tests to measure edge
+   *  sharpness (sum of absolute horizontal luminance differences) and frame-to-frame flicker at
+   *  full precision (unlike `readPixels`' `samples`, which are a sparse grid rounded to 1/100). */
+  readPixelRow: (yFraction = 0.5) => {
+    game.renderFrame();
+    const gl = game.gfx.renderer.getContext();
+    const w = gl.drawingBufferWidth;
+    const h = gl.drawingBufferHeight;
+    const y = Math.max(0, Math.min(h - 1, Math.floor(yFraction * h)));
+    const buf = new Uint8Array(w * 4);
+    gl.readPixels(0, y, w, 1, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const luminance = new Array<number>(w);
+    for (let x = 0; x < w; x++) {
+      const i = x * 4;
+      luminance[x] = (0.2126 * buf[i]! + 0.7152 * buf[i + 1]! + 0.0722 * buf[i + 2]!) / 255;
+    }
+    return { width: w, y, luminance };
+  },
 };
 (window as unknown as { __gta7: typeof api }).__gta7 = api;

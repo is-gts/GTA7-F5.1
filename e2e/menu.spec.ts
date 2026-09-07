@@ -144,7 +144,7 @@ test.describe('settings menu', () => {
     await menuSet(page, 'preset', 'high');
     let s = await snap(page);
     expect(s.quality).toBe('high');
-    expect(s.pipeline?.aa).toBe('smaa');
+    expect(s.pipeline?.aa).toBe('taa');
 
     await menuSet(page, 'aa', 'fxaa');
     s = await snap(page);
@@ -154,7 +154,7 @@ test.describe('settings menu', () => {
     await menuSet(page, 'preset', 'high'); // "reset to preset" is just re-applying the preset
     s = await snap(page);
     expect(s.quality).toBe('high');
-    expect(s.pipeline?.aa).toBe('smaa');
+    expect(s.pipeline?.aa).toBe('taa');
     expect(errors, errors.join('\n')).toEqual([]);
   });
 

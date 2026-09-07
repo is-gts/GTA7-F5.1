@@ -31,6 +31,12 @@ export interface QualitySettings {
   ao: AOMode;
   /** AO buffer resolution multiplier (0.5 = half-res AO). */
   aoScale: number;
+  /** History weight when `aa === 'taa'` (see `render/TAAPass.ts`): the fraction of the clamped,
+   *  reprojected history kept each frame — `mix(history, current, 1 - taaBlend)`. Higher holds
+   *  still edges steadier (less flicker) at the cost of slightly slower convergence after a cut;
+   *  the neighbourhood clamp bounds ghosting regardless of this value. Unused (but still defined,
+   *  every preset must set it) while `aa !== 'taa'`. */
+  taaBlend: number;
   bloom: boolean;
   toneMapping: ToneMappingMode;
 
@@ -76,6 +82,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     msaaSamples: 2,
     ao: 'none',
     aoScale: 0.5,
+    taaBlend: 0.9,
     bloom: false,
     toneMapping: 'aces',
     shadows: 'single',
@@ -105,6 +112,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     msaaSamples: 4,
     ao: 'none',
     aoScale: 0.5,
+    taaBlend: 0.9,
     bloom: true,
     toneMapping: 'aces',
     shadows: 'csm',
@@ -130,10 +138,11 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     adaptiveResolution: false,
     targetFps: 60,
     minRenderScale: 0.7,
-    aa: 'smaa',
+    aa: 'taa',
     msaaSamples: 4,
     ao: 'gtao',
     aoScale: 0.5,
+    taaBlend: 0.9,
     bloom: true,
     toneMapping: 'aces',
     shadows: 'csm',
@@ -163,6 +172,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     msaaSamples: 4,
     ao: 'gtao',
     aoScale: 1,
+    taaBlend: 0.9375,
     bloom: true,
     toneMapping: 'agx',
     shadows: 'csm',
