@@ -24,6 +24,7 @@ import {
   type QualityPresetName,
   type QualitySettings,
 } from '../core/Quality';
+import { isWeatherStateName, type WeatherStateName } from '../world/Weather';
 
 export interface MenuStats {
   /** `Engine.stats.frame` — rendering keeps advancing this even while the game is paused/menu is
@@ -36,6 +37,7 @@ export interface MenuCallbacks {
   getQuality(): QualitySettings;
   getGameplay(): GameplaySettings;
   getTimeOfDay(): number;
+  getWeather(): WeatherStateName;
   /** Called when the menu opens or closes (pauses/resumes the game, unlocks the pointer). */
   onOpenChange(open: boolean): void;
   /** A preset button (or "Reset to preset") was clicked: replace the whole quality object. */
@@ -44,6 +46,7 @@ export interface MenuCallbacks {
   onQualityChange(patch: Partial<QualitySettings>): void;
   onGameplayChange(patch: Partial<GameplaySettings>): void;
   onTimeOfDay(hours: number): void;
+  onWeather(name: WeatherStateName): void;
   onRestart(): void;
   getStats(): MenuStats;
 }
@@ -110,6 +113,7 @@ const GAMEPLAY_KNOBS: Knob[] = [
 ];
 
 const PRESETS: QualityPresetName[] = ['low', 'medium', 'high', 'ultra'];
+const WEATHER_OPTIONS: readonly WeatherStateName[] = ['clear', 'overcast', 'rain'];
 const QUALITY_DEBOUNCE_S = 0.35;
 const GAMEPLAY_DEBOUNCE_S = 0.35;
 const TOD_DEBOUNCE_S = 0.15;
@@ -131,6 +135,7 @@ export class Menu {
   private readonly benchmarkResultEl: HTMLElement;
   private readonly todInput: HTMLInputElement;
   private readonly todValueEl: HTMLElement;
+  private readonly weatherInput: HTMLSelectElement;
   private readonly qualityInputs = new Map<string, HTMLInputElement | HTMLSelectElement>();
   private readonly gameplayInputs = new Map<string, HTMLInputElement | HTMLSelectElement>();
   private readonly valueLabels = new Map<string, HTMLElement>();
@@ -163,6 +168,10 @@ export class Menu {
               <input type="range" min="0" max="24" step="0.25" data-key="timeOfDay" />
               <span class="sm-value" data-key-value="timeOfDay"></span>
             </label>
+            <label class="sm-row" data-key="weather">
+              <span class="sm-label">Weather</span>
+              <select data-key="weather">${WEATHER_OPTIONS.map((o) => `<option value="${o}">${o}</option>`).join('')}</select>
+            </label>
             ${GAMEPLAY_KNOBS.map((k) => this.knobHtml(k)).join('')}
           </section>
         </div>
@@ -182,6 +191,7 @@ export class Menu {
     this.benchmarkResultEl = this.root.querySelector('[data-el="benchmarkResult"]')!;
     this.todInput = this.root.querySelector('input[data-key="timeOfDay"]')!;
     this.todValueEl = this.root.querySelector('[data-key-value="timeOfDay"]')!;
+    this.weatherInput = this.root.querySelector('select[data-key="weather"]')!;
 
     for (const k of QUALITY_KNOBS) this.qualityInputs.set(k.key, this.root.querySelector(`[data-key="${k.key}"]`)!);
     for (const k of GAMEPLAY_KNOBS) this.gameplayInputs.set(k.key, this.root.querySelector(`[data-key="${k.key}"]`)!);
@@ -237,6 +247,11 @@ export class Menu {
       const v = Number(this.todInput.value);
       this.pendingTod.cancel();
       this.cb.onTimeOfDay(v);
+    });
+
+    this.weatherInput.addEventListener('change', () => {
+      const v = this.weatherInput.value;
+      if (isWeatherStateName(v)) this.cb.onWeather(v);
     });
 
     for (const k of QUALITY_KNOBS) this.wireKnob(k, this.qualityInputs, (patch) => this.queueQuality(patch, !k.debounce));
@@ -328,6 +343,7 @@ export class Menu {
       this.todInput.value = String(hours);
       this.todValueEl.textContent = formatHours(hours);
     }
+    this.weatherInput.value = this.cb.getWeather();
   }
 
   private refreshKnob(k: Knob, inputs: Map<string, HTMLInputElement | HTMLSelectElement>, source: Record<string, unknown>, q: QualitySettings): void {
@@ -432,6 +448,9 @@ export class Menu {
       this.basePreset = value;
       this.pendingQuality.cancel();
       this.cb.onPreset(value);
+      this.refreshFromState();
+    } else if (key === 'weather' && isWeatherStateName(value)) {
+      this.cb.onWeather(value);
       this.refreshFromState();
     } else if (isQualitySettingsKey(key)) {
       this.applyQualityPatch({ [key]: value } as Partial<QualitySettings>);

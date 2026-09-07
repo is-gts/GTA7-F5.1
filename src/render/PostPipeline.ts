@@ -1,8 +1,9 @@
 /**
  * HDR post-processing pipeline built on EffectComposer.
  *
- *   RenderPass / SSAARenderPass (HalfFloat, optional MSAA)
+ *   RenderPass / SSAARenderPass / TAAPass (HalfFloat, optional MSAA)
  *     → GTAO or SSAO (optionally at reduced resolution)
+ *     → SSRPass (wet-road screen-space reflections, high/ultra only)
  *     → UnrealBloom (threshold 1.0: only HDR highlights bloom)
  *     → OutputPass (tone mapping + sRGB)
  *     → SMAA 1x or FXAA (post-tonemap edge AA, complements/replaces MSAA)
@@ -19,6 +20,7 @@ import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { FXAAPass } from 'three/addons/postprocessing/FXAAPass.js';
 import type { Pass } from 'three/addons/postprocessing/Pass.js';
 import type { AAMode, QualitySettings } from '../core/Quality';
+import { SSRPass } from './SSRPass';
 import { TAAPass } from './TAAPass';
 
 /** AA modes this pipeline implements (drives the settings-menu dropdown, see `Menu.ts`). */
@@ -41,6 +43,7 @@ export class PostPipeline {
   private readonly passes: Pass[] = [];
   private readonly gtao: GTAOPass | null = null;
   private readonly ssao: SSAOPass | null = null;
+  private readonly ssr: SSRPass | null = null;
   private readonly bloom: UnrealBloomPass | null = null;
   private readonly taa: TAAPass | null = null;
   private readonly aoScale: number;
@@ -103,17 +106,25 @@ export class PostPipeline {
       this.add(ssao, 'ssao');
     }
 
-    // 3. bloom on HDR highlights only
+    // 3. screen-space reflections for wet roads (high/ultra only) — composited before bloom so a
+    //    bright reflected window/lamp can still bloom same as the real thing.
+    if (q.ssr) {
+      const ssr = new SSRPass(scene, camera, Math.floor(width * pr), Math.floor(height * pr), { scale: q.ssrScale });
+      this.ssr = ssr;
+      this.add(ssr, 'ssr');
+    }
+
+    // 4. bloom on HDR highlights only
     if (q.bloom) {
       const bloom = new UnrealBloomPass(new Vector2(Math.floor(width * pr), Math.floor(height * pr)), 0.35, 0.5, 1.0);
       this.bloom = bloom;
       this.add(bloom, 'bloom');
     }
 
-    // 4. tone mapping + colour space
+    // 5. tone mapping + colour space
     this.add(new OutputPass(), 'output');
 
-    // 5. post-tonemap edge anti-aliasing
+    // 6. post-tonemap edge anti-aliasing
     if (q.aa === 'smaa') this.add(new SMAAPass(), 'smaa');
     else if (q.aa === 'fxaa') this.add(new FXAAPass(), 'fxaa');
 
@@ -153,6 +164,11 @@ export class PostPipeline {
 
   setBloomStrength(strength: number): void {
     if (this.bloom) this.bloom.strength = strength;
+  }
+
+  /** Road wetness (0..1) driving SSR reflectivity; a no-op when `q.ssr` is false (no pass built). */
+  setWetness(w: number): void {
+    this.ssr?.setWetness(w);
   }
 
   dispose(): void {

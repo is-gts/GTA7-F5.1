@@ -29,6 +29,7 @@ import { GameRenderer } from '../render/GameRenderer';
 import { Lighting } from '../render/Lighting';
 import { LocalLights, type LampPoint } from '../render/LocalLights';
 import { MaterialRegistry } from '../render/MaterialRegistry';
+import { Rain } from '../render/Rain';
 import { SkyDome } from '../render/SkyDome';
 import { HUD } from '../ui/HUD';
 import { Menu } from '../ui/Menu';
@@ -37,6 +38,7 @@ import { TouchControls, isTouchDevice } from '../ui/TouchControls';
 import { Random } from '../world/Random';
 import { buildCity, type CityView } from '../world/CityBuilder';
 import { buildingAABBs, generateCity, lampHeadPosition, lanePoint, type CityData, type CityParams } from '../world/CityGenerator';
+import { createWeatherState, setWeatherState, stepWeather, type WeatherState, type WeatherStateName } from '../world/Weather';
 import {
   angleBetweenDeg,
   daylightFactor,
@@ -58,6 +60,8 @@ export interface GameOptions {
   devicePixelRatio?: number;
   /** Initial time of day in hours (0..24). */
   timeOfDay?: number;
+  /** Initial weather (`?weather=` URL param / menu default). Defaults to 'clear'. */
+  weather?: WeatherStateName;
   /** Real seconds per in-game hour (default 90 — a full day every 36 real minutes). */
   secondsPerGameHour?: number;
   storage?: Storage | null;
@@ -155,6 +159,16 @@ export class Game {
   readonly clock: TimeOfDay;
   /** Pooled real-time street lamps that track the player/vehicle (see `render/LocalLights.ts`). */
   readonly localLights: LocalLights;
+  /** Weather: clear/overcast/rain, surface wetness and rain-particle intensity (see `world/Weather.ts`). */
+  weather: WeatherState;
+  /** Deterministic RNG driving weather transitions, seeded from the city seed. */
+  private readonly weatherRng: Random;
+  /** Rain streak particle system (see `render/Rain.ts`), quality-gated by `rainStreaks`. */
+  readonly rain: Rain;
+  /** Overcast factor (0..1, state-driven) as of the last sky-atmosphere recomputation — throttling
+   *  bookkeeping alongside `lastEnvDir`, so a weather-state change forces a PMREM regen even when
+   *  the sun hasn't moved enough on its own to trigger one. */
+  private lastEnvOvercast = 0;
   /** World-space lamp-head positions, computed once from the (static) city data. */
   private readonly lampHeads: LampPoint[];
   /** Player car headlights: two `SpotLight`s reparented onto whichever vehicle is currently driven
@@ -272,10 +286,14 @@ export class Game {
     this.city = generateCity(opts.city);
     this.lampHeads = this.city.lamps.map((l) => lampHeadPosition(l));
     this.vehicleRng = new Random(this.city.params.seed ^ 0x5eed1);
+    this.weatherRng = new Random(this.city.params.seed ^ 0x4ea7e5);
+    this.weather = createWeatherState(opts.weather ?? 'clear');
     this.grid = new StaticColliderGrid(32);
     for (const box of buildingAABBs(this.city)) this.grid.insert(box);
     this.cityView = buildCity(this.city, this.quality, this.registry, this.gfx.maxAnisotropy);
     this.scene.add(this.cityView.root);
+    this.rain = new Rain(this.city.params.seed, this.quality);
+    this.scene.add(this.rain.root);
 
     this.hud = new HUD(opts.hudContainer);
     this.hud.setPerfOverlayVisible(this.gameplay.hudPerfOverlay);
@@ -308,6 +326,7 @@ export class Game {
       getQuality: () => this.quality,
       getGameplay: () => this.gameplay,
       getTimeOfDay: () => this.clock.hours,
+      getWeather: () => this.weather.state,
       onOpenChange: (open) => {
         this.paused = open;
         if (open) {
@@ -321,6 +340,7 @@ export class Game {
       onQualityChange: (patch) => this.applyQuality({ ...this.quality, ...patch }),
       onGameplayChange: (patch) => this.applyGameplaySettings({ ...this.gameplay, ...patch }),
       onTimeOfDay: (hours) => this.setTimeOfDay(hours),
+      onWeather: (name) => this.setWeather(name),
       onRestart: () => this.respawn(),
       getStats: () => ({ frame: this.engine.stats.frame, drawCalls: this.gfx.stats().drawCalls }),
     });
@@ -375,10 +395,13 @@ export class Game {
     this.scene.remove(this.cityView.root);
     this.cityView.dispose();
     this.cityView = buildCity(this.city, q, this.registry, this.gfx.maxAnisotropy);
+    this.cityView.setWetness(this.weather.wetness); // fresh materials start at wetness 0 otherwise
     this.scene.add(this.cityView.root);
     this.lighting.rebuild(q);
     this.lighting.onCameraChanged();
     this.gfx.applyQuality(q, this.scene, this.camera, this.dpr);
+    this.gfx.pipeline?.setWetness(this.weather.wetness); // new pipeline's SSR pass (if any) too
+    this.rain.rebuild(q);
     this.localLights.setQuality(q);
     this.traffic.rebuild(q, this.trafficFocus());
     this.pedestrians.rebuild(q, this.trafficFocus());
@@ -433,6 +456,15 @@ export class Game {
     this.applyTimeOfDay(forceEnv);
   }
 
+  // --- weather -----------------------------------------------------------------
+  /** Force the weather to `name` (settings menu / `?weather=` URL param / debug API) and
+   *  immediately recompute the sky/fog atmosphere so the change reads instantly, not on the next
+   *  throttled `applyTimeOfDay` tick. */
+  setWeather(name: WeatherStateName): void {
+    this.weather = setWeatherState(this.weather, name);
+    this.applyTimeOfDay(false);
+  }
+
   /**
    * Recompute sun/moon direction, fog, hemisphere, night materials, vehicle-light toggles and (at
    * most every `ENV_REGEN_THRESHOLD_DEG` of sun movement) the PMREM environment, from `clock.hours`.
@@ -446,16 +478,26 @@ export class Game {
     const daylight = daylightFactor(hours);
     const night = 1 - daylight;
     this.nightFactor = night;
+    // Weather → overcast look: raised turbidity/mie greys and dims the sky, a heavier sun/fog tint
+    // toward grey once it's actually raining. State-driven (not the slower `wetness` scalar) so the
+    // sky visibly changes the moment the weather state flips, same as real overcast weather.
+    const overcast = this.weather.state === 'rain' ? 1 : this.weather.state === 'overcast' ? 0.55 : 0;
+    this.sky.setAtmosphere({
+      turbidity: 4 + overcast * 14,
+      rayleigh: Math.max(0.4, 1.6 - overcast * 1.0),
+      mieCoefficient: 0.004 + overcast * 0.02,
+      mieDirectionalG: 0.85,
+    });
     if (angles.elevationDeg > -2) {
       this.lighting.sunDirection.copy(this.sky.sunDirection);
-      this.lighting.setSun({ color: this.sky.sunColor(), intensity: Math.max(0.12, this.sky.sunIntensity()) });
+      this.lighting.setSun({ color: this.sky.sunColor(), intensity: Math.max(0.12, this.sky.sunIntensity()) * (1 - overcast * 0.65) });
     } else {
       // Moonlight: a faint cool light from the sun's antipode so night surfaces stay readable.
       const m = moonDirection(hours);
       this.lighting.sunDirection.set(m.x, m.y, m.z);
       this.lighting.setSun({ color: new Color(0x8fa6d8), intensity: 0.18 });
     }
-    const horizon = this.sky.horizonColor();
+    const horizon = this.sky.horizonColor().lerp(new Color(0x9aa0a8), overcast * 0.7); // greyer fog while raining
     this.lighting.setFog(horizon, this.quality.drawDistance * 0.55, this.quality.farDistance);
     const hemiBase = this.quality.envReflections ? 0.35 : 0.85;
     this.lighting.setHemisphere(
@@ -471,9 +513,13 @@ export class Game {
     if (this.quality.envReflections) {
       const sunDir = this.sky.sunDirection;
       const angleMoved = angleBetweenDeg(this.lastEnvDir, { x: sunDir.x, y: sunDir.y, z: sunDir.z });
-      if (forceEnv || angleMoved > ENV_REGEN_THRESHOLD_DEG) {
+      // A turbidity/mie change from the weather flipping (`overcastChanged`) alone won't move the
+      // sun, so it needs its own regen trigger alongside the existing sun-angle throttle.
+      const overcastChanged = Math.abs(overcast - this.lastEnvOvercast) > 0.05;
+      if (forceEnv || angleMoved > ENV_REGEN_THRESHOLD_DEG || overcastChanged) {
         this.scene.environment = this.sky.updateEnvironment();
         this.lastEnvDir = { x: sunDir.x, y: sunDir.y, z: sunDir.z };
+        this.lastEnvOvercast = overcast;
         this.envRegens++;
       }
     } else {
@@ -545,6 +591,8 @@ export class Game {
     }
     if (this.paused) return;
     this.updateClock(dt);
+    this.weather = stepWeather(this.weather, dt, this.weatherRng);
+    this.cityView.setWetness(this.weather.wetness);
 
     // While the "BUSTED" overlay is up, the player (on foot or in a car) is frozen — no movement
     // input is processed — so the fade genuinely reads as "caught", not "still driving with a red
@@ -836,6 +884,10 @@ export class Game {
     // only ever changes the cached `nightFactor` they read).
     this.localLights.update(this.lampHeads, this.focus.x, this.focus.z, this.nightFactor);
     this.sky.updateStars(this.camera.position, this.nightFactor);
+    // `simTime` (not wall-clock frameDelta accumulation) so headless `simulate()`/screenshot
+    // sequences stay reproducible — see `Rain.update`'s doc comment.
+    this.rain.update(this.camera.position.x, this.camera.position.y, this.camera.position.z, this.engine.stats.simTime, this.weather.rainVisual);
+    this.gfx.pipeline?.setWetness(this.weather.wetness);
     this.gfx.render(frameDelta);
 
     this.minimap.update(frameDelta, () => ({
@@ -926,6 +978,7 @@ export class Game {
     this.headlightTargetL.removeFromParent();
     this.headlightTargetR.removeFromParent();
     this.localLights.dispose();
+    this.rain.dispose();
     for (const v of this.vehicles) v.dispose(this.registry);
     this.traffic.dispose();
     this.pedestrians.dispose();

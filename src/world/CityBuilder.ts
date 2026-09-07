@@ -37,7 +37,7 @@ import {
 } from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import type { QualitySettings } from '../core/Quality';
-import type { MaterialRegistry } from '../render/MaterialRegistry';
+import type { MaterialRegistry, ShaderPatch } from '../render/MaterialRegistry';
 import {
   FACADE_STYLES,
   createAsphaltMaps,
@@ -45,6 +45,7 @@ import {
   createFacadeMaps,
   createGlowSprite,
   createGrassMap,
+  createPuddleMask,
   createRoadMaps,
   type FacadeMaps,
 } from '../render/Textures';
@@ -55,6 +56,9 @@ export interface CityView {
   root: Group;
   /** Materials whose emissive intensity follows the time of day. */
   setNightFactor(f: number): void;
+  /** Road/intersection/concrete (and, milder, building facade) wetness 0..1 — see the wet-road
+   *  shader patch below and `docs/tasks/08-weather-wet-roads.md`. */
+  setWetness(w: number): void;
   /** Number of chunks currently within drawDistance (for diagnostics). */
   visibleChunks(cameraPosition: Vector3): number;
   dispose(): void;
@@ -68,6 +72,15 @@ interface FacadeMaterialSet {
 }
 
 const FACADE_PATCH_KEY = 'gta7/facade-uv';
+
+/** Chain several independent `ShaderPatch`es (e.g. the facade UV patch and the wet-facade patch —
+ *  one touches only the vertex shader, the other only the fragment shader) into one, since
+ *  `MaterialRegistry.register` only takes a single patch per material. */
+function chainPatches(...patches: ShaderPatch[]): ShaderPatch {
+  return (shader, renderer) => {
+    for (const p of patches) p(shader, renderer);
+  };
+}
 
 /** Vertex-shader patch: per-instance UV scale/offset using custom instanced attributes. */
 function facadePatch(shader: { vertexShader: string }): void {
@@ -95,6 +108,71 @@ attribute vec2 aUvOffset;`,
   #endif
 }`,
     );
+}
+
+const WET_GROUND_PATCH_KEY = 'gta7/wet-ground';
+const WET_FACADE_PATCH_KEY = 'gta7/wet-facade';
+
+/**
+ * Shared uniform driving every wet-surface material patch below (`setWetness` just writes one
+ * number into it — all patched materials read the same `{value}` object, so a single write updates
+ * roads, intersections, sidewalks/concrete and building facades together, no per-material loop).
+ */
+function createWetnessUniform(): { value: number } {
+  return { value: 0 };
+}
+
+/**
+ * Ground-surface (road/intersection/concrete) wet patch: lowers roughness overall (`roughness *=
+ * mix(1, 0.15, wetness)`), darkens albedo (`*= mix(1, 0.6, wetness)`), and — inside puddle-mask
+ * blobs sampled from a tiled noise texture — pushes roughness to ~0.02 and flattens the (already
+ * view-space, by this point in the shader) shading normal back toward the smooth per-vertex normal.
+ * See `docs/tasks/08-weather-wet-roads.md`.
+ */
+function wetGroundPatch(wetness: { value: number }, puddleMap: Texture, puddleTiling: number): ShaderPatch {
+  return (shader) => {
+    shader.uniforms.uWetness = wetness;
+    shader.uniforms.uPuddleMap = { value: puddleMap };
+    shader.uniforms.uPuddleTiling = { value: puddleTiling };
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+uniform float uWetness;
+uniform sampler2D uPuddleMap;
+uniform float uPuddleTiling;`,
+      )
+      .replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+{
+  float puddle = texture2D( uPuddleMap, vMapUv * uPuddleTiling ).r;
+  roughnessFactor *= mix( 1.0, 0.15, uWetness );
+  roughnessFactor = mix( roughnessFactor, 0.02, uWetness * puddle );
+}`,
+      )
+      .replace('#include <map_fragment>', `#include <map_fragment>\ndiffuseColor.rgb *= mix( 1.0, 0.6, uWetness );`)
+      .replace(
+        '#include <normal_fragment_maps>',
+        `#include <normal_fragment_maps>
+{
+  float puddle = texture2D( uPuddleMap, vMapUv * uPuddleTiling ).r;
+  normal = normalize( mix( normal, normalize( vNormal ), uWetness * puddle * 0.85 ) );
+}`,
+      );
+  };
+}
+
+/** Milder wet patch for building facades: a slight roughness/albedo shift only (no puddle mask —
+ *  vertical surfaces don't pool water), so rain reads as "the whole city got wet", not just roads. */
+function wetFacadePatch(wetness: { value: number }): ShaderPatch {
+  return (shader) => {
+    shader.uniforms.uWetness = wetness;
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\nuniform float uWetness;`)
+      .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>\nroughnessFactor *= mix( 1.0, 0.55, uWetness );`)
+      .replace('#include <map_fragment>', `#include <map_fragment>\ndiffuseColor.rgb *= mix( 1.0, 0.85, uWetness );`);
+  };
 }
 
 /**
@@ -219,6 +297,14 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
   /** Just above the sidewalk surface (built at y=0.15 below) to avoid z-fighting. */
   const LIGHT_POOL_Y = 0.155;
 
+  // --- wet-surface uniform (shared by every wet material patch — see `setWetness` on the returned
+  // view) and the puddle mask that pushes ground-surface puddles glossy/flat within it -----------
+  const wetnessUniform = createWetnessUniform();
+  const puddleMap = createPuddleMask(Math.max(128, texSize / 2), aniso, p.seed + 5);
+  disposables.push(puddleMap);
+  /** Puddle blobs repeat roughly every 20 m of road/ground. */
+  const PUDDLE_TILING = 1 / 20;
+
   // --- materials ------------------------------------------------------------
   const facadeSets: FacadeMaterialSet[] = [];
   for (let s = 0; s < FACADE_STYLE_COUNT; s++) {
@@ -234,7 +320,7 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
       metalness: s === 0 ? 0.35 : 0.05,
       envMapIntensity: quality.envReflections ? 0.8 : 0,
     });
-    registry.register(near, { patch: facadePatch, key: FACADE_PATCH_KEY });
+    registry.register(near, { patch: chainPatches(facadePatch, wetFacadePatch(wetnessUniform)), key: `${FACADE_PATCH_KEY}|${WET_FACADE_PATCH_KEY}` });
     const far = new MeshLambertMaterial({
       color: new Color(style.wall[0] / 255, style.wall[1] / 255, style.wall[2] / 255).multiplyScalar(0.9),
     });
@@ -272,6 +358,7 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
       polygonOffsetFactor: -4,
       polygonOffsetUnits: -4,
     }),
+    { patch: wetGroundPatch(wetnessUniform, puddleMap, PUDDLE_TILING), key: WET_GROUND_PATCH_KEY },
   );
   const asphaltMat = registry.register(
     new MeshStandardMaterial({
@@ -285,6 +372,7 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
       polygonOffsetFactor: -4,
       polygonOffsetUnits: -4,
     }),
+    { patch: wetGroundPatch(wetnessUniform, puddleMap, PUDDLE_TILING), key: WET_GROUND_PATCH_KEY },
   );
   // Same near-coincident-depth reasoning as roadMat/asphaltMat above: the inner-block concrete/
   // park-grass decal quads sit only 0.5-1 cm above the sidewalk boxes they're merged with (or the
@@ -292,6 +380,7 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
   // test. Both materials get the same defensive bias.
   const concreteMat = registry.register(
     new MeshStandardMaterial({ map: concrete.map, normalMap: concrete.normalMap, roughness: 0.9, metalness: 0, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }),
+    { patch: wetGroundPatch(wetnessUniform, puddleMap, PUDDLE_TILING), key: WET_GROUND_PATCH_KEY },
   );
   const grassMat = registry.register(
     new MeshStandardMaterial({ map: grass, roughness: 1, metalness: 0, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }),
@@ -579,6 +668,9 @@ export function buildCity(city: CityData, quality: QualitySettings, registry: Ma
       const t = Math.max(0, Math.min(1, f));
       for (const n of nightMaterials) n.mat.emissiveIntensity = n.day + (n.night - n.day) * t;
       for (const n of nightOpacityMaterials) n.mat.opacity = n.day + (n.night - n.day) * t;
+    },
+    setWetness(w: number) {
+      wetnessUniform.value = Math.max(0, Math.min(1, w));
     },
     visibleChunks(cameraPosition: Vector3): number {
       let n = 0;

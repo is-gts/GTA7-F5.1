@@ -12,7 +12,7 @@ import {
   Texture,
   NoColorSpace,
 } from 'three';
-import { Random } from '../world/Random';
+import { Random, valueNoise2D } from '../world/Random';
 
 export interface FacadeMaps {
   map: Texture;
@@ -294,6 +294,46 @@ function createNormalMapFromNoise(size: number, strength: number, rng: Random): 
   }
   ctx.putImageData(img, 0, 0);
   return canvas;
+}
+
+/**
+ * Tiled greyscale puddle mask (single channel, replicated to RGB so it can share the same texture
+ * pipeline as everything else): irregular blobs from thresholded, smoothed value noise, RepeatWrapping
+ * so it tiles seamlessly across the whole road network. Sampled by the wet-road material patch
+ * (`world/CityBuilder.ts`) to push roughness toward ~0.02 and flatten the normal inside puddles —
+ * see `docs/tasks/08-weather-wet-roads.md`. `NoColorSpace` (it's a mask, not colour data).
+ */
+export function createPuddleMask(size: number, anisotropy: number, seed = 6): Texture {
+  const { canvas, ctx } = createCanvas(size, size);
+  const img = ctx.createImageData(size, size);
+  const d = img.data;
+  // Two octaves of tileable value noise (valueNoise2D already wraps on integer cell boundaries, so
+  // sampling at integer-periodic coordinates gives a seamlessly tiling field), thresholded into
+  // rounded blob shapes with a soft edge.
+  const cells = Math.max(4, Math.round(size / 48));
+  const noiseSeed = seed * 7919 + 1;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = (x / size) * cells;
+      const v = (y / size) * cells;
+      const n1 = valueNoise2D(u, v, noiseSeed);
+      const n2 = valueNoise2D(u * 2.3 + 11, v * 2.3 + 7, noiseSeed + 1) * 0.5;
+      const n = (n1 + n2) / 1.5;
+      const mask = clamp255((smoothstep01(n, 0.42, 0.58) ) * 255);
+      const i = (y * size + x) * 4;
+      d[i] = mask;
+      d[i + 1] = mask;
+      d[i + 2] = mask;
+      d[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return finish(canvas, { srgb: false, anisotropy });
+}
+
+function smoothstep01(x: number, lo: number, hi: number): number {
+  const t = x < lo ? 0 : x > hi ? 1 : (x - lo) / (hi - lo);
+  return t * t * (3 - 2 * t);
 }
 
 /** Small round glow sprite for lamp heads / headlights (alpha radial gradient). */

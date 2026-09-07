@@ -68,6 +68,15 @@ export interface QualitySettings {
   /** Max real-time `PointLight`s for nearby street lamps at night (`render/LocalLights.ts`); also
    *  gates the player car's headlight `SpotLight`s (0 = none, low falls back to ground decals). */
   maxLocalLights: number;
+  /** Rain streak count for the quality-gated particle system (`render/Rain.ts`); one InstancedMesh,
+   *  so this only ever costs one extra draw call regardless of count. */
+  rainStreaks: number;
+  /** Screen-space reflections for wet roads (`render/SSRPass.ts`) — high/ultra only; costs an extra
+   *  small G-buffer scene render plus a reduced-resolution ray-march pass. */
+  ssr: boolean;
+  /** SSR G-buffer + reflection-buffer resolution multiplier relative to the render target (unused,
+   *  but still defined, while `ssr` is false). */
+  ssrScale: number;
 }
 
 export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
@@ -100,6 +109,9 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     propDensity: 0.5,
     damageSmoke: false,
     maxLocalLights: 0,
+    rainStreaks: 600,
+    ssr: false,
+    ssrScale: 0.5,
   },
   medium: {
     preset: 'medium',
@@ -130,6 +142,9 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     propDensity: 0.75,
     damageSmoke: true,
     maxLocalLights: 4,
+    rainStreaks: 1500,
+    ssr: false,
+    ssrScale: 0.5,
   },
   high: {
     preset: 'high',
@@ -160,6 +175,9 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     propDensity: 1,
     damageSmoke: true,
     maxLocalLights: 8,
+    rainStreaks: 4000,
+    ssr: true,
+    ssrScale: 0.5,
   },
   ultra: {
     preset: 'ultra',
@@ -190,6 +208,9 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     propDensity: 1,
     damageSmoke: true,
     maxLocalLights: 16,
+    rainStreaks: 6000,
+    ssr: true,
+    ssrScale: 0.75,
   },
 };
 

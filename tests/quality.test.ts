@@ -36,6 +36,7 @@ describe('quality presets', () => {
       expect(b.maxTraffic).toBeGreaterThanOrEqual(a.maxTraffic);
       expect(b.anisotropy).toBeGreaterThanOrEqual(a.anisotropy);
       expect(b.maxLocalLights).toBeGreaterThanOrEqual(a.maxLocalLights);
+      expect(b.rainStreaks).toBeGreaterThanOrEqual(a.rainStreaks);
     }
     expect(QUALITY_PRESETS.low.maxLocalLights).toBe(0);
     expect(QUALITY_PRESETS.medium.maxLocalLights).toBe(4);
@@ -47,6 +48,19 @@ describe('quality presets', () => {
     expect(QUALITY_PRESETS.medium.damageSmoke).toBe(true);
     expect(QUALITY_PRESETS.high.damageSmoke).toBe(true);
     expect(QUALITY_PRESETS.ultra.damageSmoke).toBe(true);
+  });
+
+  it('gates SSR to high/ultra only, with sane rain-streak counts everywhere', () => {
+    expect(QUALITY_PRESETS.low.ssr).toBe(false);
+    expect(QUALITY_PRESETS.medium.ssr).toBe(false);
+    expect(QUALITY_PRESETS.high.ssr).toBe(true);
+    expect(QUALITY_PRESETS.ultra.ssr).toBe(true);
+    for (const name of ['low', 'medium', 'high', 'ultra'] as const) {
+      const q = QUALITY_PRESETS[name];
+      expect(q.rainStreaks).toBeGreaterThan(0);
+      expect(q.ssrScale).toBeGreaterThan(0);
+      expect(q.ssrScale).toBeLessThanOrEqual(1);
+    }
   });
 
   it('getPreset returns a copy', () => {

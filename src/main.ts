@@ -3,6 +3,7 @@ import { Game } from './game/Game';
 import { QUALITY_PRESETS, getPreset, isPresetName, loadSavedQuality } from './core/Quality';
 import type { QualityPresetName, QualitySettings } from './core/Quality';
 import { isTouchDevice } from './ui/TouchControls';
+import { isWeatherStateName } from './world/Weather';
 
 const canvas = document.getElementById('game') as HTMLCanvasElement | null;
 const hudContainer = document.getElementById('hud');
@@ -44,6 +45,7 @@ const cols = params.get('cols');
 const rows = params.get('rows');
 const tod = params.get('tod');
 const dayspeed = params.get('dayspeed');
+const weatherParam = params.get('weather');
 const autostart = params.get('autostart') !== '0';
 
 const game = new Game({
@@ -58,6 +60,7 @@ const game = new Game({
   devicePixelRatio: window.devicePixelRatio || 1,
   timeOfDay: tod ? Number(tod) : 14,
   ...(dayspeed ? { secondsPerGameHour: Math.max(0.01, Number(dayspeed)) } : {}),
+  ...(isWeatherStateName(weatherParam) ? { weather: weatherParam } : {}),
   storage,
   touch: touchDetected,
 });
@@ -82,6 +85,9 @@ const api = {
   setQuality: (name: QualityPresetName) => game.setQualityPreset(name),
   setKey: (code: string, down: boolean) => game.input.setKey(code, down),
   setTimeOfDay: (h: number) => game.setTimeOfDay(h),
+  setWeather: (name: string) => {
+    if (isWeatherStateName(name)) game.setWeather(name);
+  },
   /** `window.__gta7.menu` — settings-menu automation hooks for e2e tests. */
   menu: {
     open: () => game.menu.open(),
@@ -118,6 +124,7 @@ const api = {
       gameplay: game.gameplay,
       input: { virtual: { ...game.input.virtual } },
       touch: game.touch !== null,
+      weather: { state: game.weather.state, wetness: game.weather.wetness, rainVisual: game.weather.rainVisual },
     };
   },
   /** Render a frame and sample the default framebuffer: mean/variance of luminance over a grid. */
