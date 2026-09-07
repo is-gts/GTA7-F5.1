@@ -48,6 +48,8 @@ export interface MenuCallbacks {
   onTimeOfDay(hours: number): void;
   onWeather(name: WeatherStateName): void;
   onRestart(): void;
+  /** "Reset missions" footer button: wipe the missions save (money + completed ids). */
+  onResetMissions(): void;
   getStats(): MenuStats;
 }
 
@@ -178,6 +180,7 @@ export class Menu {
         <div class="sm-footer">
           <button type="button" class="sm-btn" data-action="reset">Reset to preset</button>
           <button type="button" class="sm-btn" data-action="restart">Restart game</button>
+          <button type="button" class="sm-btn" data-action="resetmissions">Reset missions</button>
           <button type="button" class="sm-btn" data-action="benchmark">Benchmark (5s)</button>
           <span class="sm-benchmark-result" data-el="benchmarkResult"></span>
           <button type="button" class="sm-btn sm-btn-primary" data-action="resume">Resume</button>
@@ -231,6 +234,7 @@ export class Menu {
       this.cb.onRestart();
       this.close();
     });
+    this.root.querySelector('[data-action="resetmissions"]')!.addEventListener('click', () => this.cb.onResetMissions());
     this.root.querySelector('[data-action="reset"]')!.addEventListener('click', () => {
       this.pendingQuality.cancel();
       this.cb.onPreset(this.basePreset);

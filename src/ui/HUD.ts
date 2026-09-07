@@ -1,4 +1,6 @@
 /** Minimal DOM heads-up display: speed, mode, performance, wanted level and control hints. */
+import { formatMissionTime } from '../game/Missions';
+
 export interface HUDData {
   speedKmh: number;
   mode: 'foot' | 'vehicle';
@@ -17,6 +19,11 @@ export interface HUDData {
   wanted: number;
   /** Busted overlay: shown while true (player was caught by police and is respawning). */
   busted: boolean;
+  /** Mission money total (see `src/game/Missions.ts`). */
+  money: number;
+  /** Active mission's next-checkpoint readout, or `null` when no mission is active: the compass
+   *  arrow pointing at the checkpoint, the leg label, its distance and the seconds left. */
+  mission: { label: string; arrow: string; distanceM: number; timeRemainingS: number } | null;
 }
 
 const FILLED_STAR = '★';
@@ -32,9 +39,13 @@ export class HUD {
   private readonly toast: HTMLElement;
   private readonly wanted: HTMLElement;
   private readonly busted: HTMLElement;
+  private readonly money: HTMLElement;
+  private readonly mission: HTMLElement;
   private toastTimer: ReturnType<typeof setTimeout> | null = null;
   private lastWanted = -1;
   private lastBusted = false;
+  private lastMoney = -1;
+  private lastMissionLabel: string | null = null;
 
   constructor(container: HTMLElement) {
     this.root = document.createElement('div');
@@ -45,6 +56,7 @@ export class HUD {
       <div class="hud-hint"></div>
       <div class="hud-wanted"></div>
       <div class="hud-money">$0</div>
+      <div class="hud-mission" hidden></div>
       <div class="hud-busted" hidden>BUSTED</div>
       <div class="hud-toast" hidden></div>`;
     container.appendChild(this.root);
@@ -55,11 +67,12 @@ export class HUD {
     this.toast = this.root.querySelector('.hud-toast')!;
     this.wanted = this.root.querySelector('.hud-wanted')!;
     this.busted = this.root.querySelector('.hud-busted')!;
+    this.money = this.root.querySelector('.hud-money')!;
+    this.mission = this.root.querySelector('.hud-mission')!;
     // Draw the (empty) star row immediately: `update()` is throttled to ~4 Hz by the caller, so
     // without this the wanted row is missing entirely for the first frames after boot.
     this.wanted.textContent = EMPTY_STAR.repeat(MAX_WANTED_STARS);
     this.lastWanted = 0;
-    // Money/score placeholder (no economy system yet — just the HUD real estate for one, per spec).
   }
 
   update(d: HUDData): void {
@@ -79,6 +92,18 @@ export class HUD {
     if (d.busted !== this.lastBusted) {
       this.lastBusted = d.busted;
       this.busted.hidden = !d.busted;
+    }
+    const money = Math.round(d.money);
+    if (money !== this.lastMoney) {
+      this.lastMoney = money;
+      this.money.textContent = `$${money}`;
+    }
+    // Arrow first (it is what the player glances at), then the leg, the distance and the clock.
+    const label = d.mission ? `${d.mission.arrow} ${d.mission.label} · ${Math.round(d.mission.distanceM)}m · ${formatMissionTime(d.mission.timeRemainingS)}` : null;
+    if (label !== this.lastMissionLabel) {
+      this.lastMissionLabel = label;
+      this.mission.hidden = label === null;
+      this.mission.textContent = label ?? '';
     }
   }
 

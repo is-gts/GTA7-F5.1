@@ -37,6 +37,7 @@ describe('quality presets', () => {
       expect(b.anisotropy).toBeGreaterThanOrEqual(a.anisotropy);
       expect(b.maxLocalLights).toBeGreaterThanOrEqual(a.maxLocalLights);
       expect(b.rainStreaks).toBeGreaterThanOrEqual(a.rainStreaks);
+      expect(b.markerSegments).toBeGreaterThanOrEqual(a.markerSegments);
     }
     expect(QUALITY_PRESETS.low.maxLocalLights).toBe(0);
     expect(QUALITY_PRESETS.medium.maxLocalLights).toBe(4);
@@ -61,6 +62,17 @@ describe('quality presets', () => {
       expect(q.ssrScale).toBeGreaterThan(0);
       expect(q.ssrScale).toBeLessThanOrEqual(1);
     }
+  });
+
+  it('gives every preset a mission-marker tessellation, cheapest on low', () => {
+    // `render/MissionMarkers.ts` reads this instead of branching on the preset name, so a custom
+    // (hand-tuned) settings object always has a defined value too.
+    for (const name of ['low', 'medium', 'high', 'ultra'] as const) {
+      expect(QUALITY_PRESETS[name].markerSegments).toBeGreaterThanOrEqual(3);
+    }
+    expect(QUALITY_PRESETS.low.markerSegments).toBe(8);
+    expect(QUALITY_PRESETS.ultra.markerSegments).toBeGreaterThan(QUALITY_PRESETS.low.markerSegments);
+    expect(isQualitySettingsKey('markerSegments')).toBe(true);
   });
 
   it('getPreset returns a copy', () => {

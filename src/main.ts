@@ -2,6 +2,7 @@ import './style.css';
 import { Game } from './game/Game';
 import { QUALITY_PRESETS, getPreset, isPresetName, loadSavedQuality } from './core/Quality';
 import type { QualityPresetName, QualitySettings } from './core/Quality';
+import { availableCount } from './game/Missions';
 import { isTouchDevice } from './ui/TouchControls';
 import { isWeatherStateName } from './world/Weather';
 
@@ -84,6 +85,13 @@ const api = {
   renderFrame: () => game.renderFrame(),
   setQuality: (name: QualityPresetName) => game.setQualityPreset(name),
   setKey: (code: string, down: boolean) => game.input.setKey(code, down),
+  /** Teleport the currently-driven vehicle (or, if on foot, the first spawned car) — used by the
+   *  missions e2e tests to drive straight into a start marker / checkpoint without simulating the
+   *  whole drive there. */
+  teleportVehicle: (x: number, z: number, heading: number) => {
+    const v = game.currentVehicle ?? game.vehicles[0];
+    v?.teleport(x, z, heading);
+  },
   setTimeOfDay: (h: number) => game.setTimeOfDay(h),
   setWeather: (name: string) => {
     if (isWeatherStateName(name)) game.setWeather(name);
@@ -116,6 +124,12 @@ const api = {
       wanted: { level: game.wanted.level, heat: game.wanted.heat },
       police: { count: game.police.count, pursuing: game.policePursuing, distance: game.police.nearestDistance(v ? v.state.x : p.x, v ? v.state.z : p.z) },
       busted: game.busted,
+      missions: {
+        available: availableCount(game.missions),
+        active: game.missions.activeId,
+        checkpoint: game.missions.activeId ? game.missions.runtime[game.missions.activeId]!.checkpointIndex : 0,
+        money: game.missions.money,
+      },
       minimap: { redraws: game.minimap.redraws },
       time: game.currentTimeOfDay,
       envRegens: game.envRegens,

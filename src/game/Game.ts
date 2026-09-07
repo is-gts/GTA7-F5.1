@@ -29,6 +29,7 @@ import { GameRenderer } from '../render/GameRenderer';
 import { Lighting } from '../render/Lighting';
 import { LocalLights, type LampPoint } from '../render/LocalLights';
 import { MaterialRegistry } from '../render/MaterialRegistry';
+import { MissionMarkers, type MarkerInput } from '../render/MissionMarkers';
 import { Rain } from '../render/Rain';
 import { SkyDome } from '../render/SkyDome';
 import { HUD } from '../ui/HUD';
@@ -51,6 +52,23 @@ import {
   type Vec3,
 } from './TimeOfDay';
 import { addWantedHeat, createWantedState, policeCountForLevel, stepWanted, POLICE_CONTACT_RANGE, type WantedState } from './Wanted';
+import {
+  activeCheckpoint,
+  advanceCheckpoint,
+  bearingArrow,
+  CHECKPOINT_RADIUS,
+  createMissionsState,
+  generateMissions,
+  loadMissionsSave,
+  relativeBearing,
+  resetMissionsSave,
+  reviveFailedMissions,
+  saveMissionsSave,
+  startMission,
+  stepActiveMission,
+  type MissionDef,
+  type MissionsState,
+} from './Missions';
 
 export interface GameOptions {
   canvas: HTMLCanvasElement;
@@ -182,6 +200,14 @@ export class Game {
   wanted: WantedState = createWantedState();
   /** Whether at least one police car currently exists and is chasing the player. */
   policePursuing = false;
+  /** Checkpoint races / delivery jobs generated from the city's road graph (see `game/Missions.ts`);
+   *  definitions are fixed for the city's lifetime, only `missions`' runtime state changes. */
+  readonly missionDefs: MissionDef[];
+  missions: MissionsState;
+  /** World markers (start/checkpoint glowing columns) for the active/available missions. */
+  readonly missionMarkers: MissionMarkers;
+  /** Reused, index-aligned marker list for `missionMarkers.update` (no per-frame allocation). */
+  private readonly missionMarkerScratch: MarkerInput[] = [];
   /** True while the "BUSTED" overlay is showing (just after being caught by police). */
   busted = false;
   private bustedContactTimer = 0;
@@ -295,6 +321,14 @@ export class Game {
     this.rain = new Rain(this.city.params.seed, this.quality);
     this.scene.add(this.rain.root);
 
+    // Missions: generated once from the (fixed) city road graph, decorrelated from the other
+    // per-city RNG streams the same way `vehicleRng`/`weatherRng` are.
+    this.missionDefs = generateMissions(this.city, this.city.params.seed ^ 0x3a11510);
+    const missionSave = loadMissionsSave(this.storage);
+    this.missions = createMissionsState(this.missionDefs, missionSave.money, missionSave.completedIds);
+    this.missionMarkers = new MissionMarkers(this.registry, this.quality.markerSegments);
+    this.scene.add(this.missionMarkers.root);
+
     this.hud = new HUD(opts.hudContainer);
     this.hud.setPerfOverlayVisible(this.gameplay.hudPerfOverlay);
 
@@ -341,6 +375,7 @@ export class Game {
       onGameplayChange: (patch) => this.applyGameplaySettings({ ...this.gameplay, ...patch }),
       onTimeOfDay: (hours) => this.setTimeOfDay(hours),
       onWeather: (name) => this.setWeather(name),
+      onResetMissions: () => this.resetMissionsProgress(),
       onRestart: () => this.respawn(),
       getStats: () => ({ frame: this.engine.stats.frame, drawCalls: this.gfx.stats().drawCalls }),
     });
@@ -405,6 +440,7 @@ export class Game {
     this.localLights.setQuality(q);
     this.traffic.rebuild(q, this.trafficFocus());
     this.pedestrians.rebuild(q, this.trafficFocus());
+    this.missionMarkers.setQuality(q.markerSegments);
     this.applyTimeOfDay(true);
     this.syncHeadlights();
     saveQuality(this.storage, q, this.gameplayForStorage());
@@ -442,6 +478,85 @@ export class Game {
     this.bustedOverlayTimer = 0;
     this.resetToSpawn();
     this.hud.showToast('Restarted');
+  }
+
+  // --- missions ----------------------------------------------------------------
+  /** Wipe saved mission progress (money + completed ids) and reset every mission back to
+   *  `'available'` — the settings menu's "Reset missions" button. Does not touch the player/vehicle
+   *  position or the wanted level (see `respawn` for that). */
+  resetMissionsProgress(): void {
+    resetMissionsSave(this.storage);
+    this.missions = createMissionsState(this.missionDefs);
+    this.hud.showToast('Missions reset');
+  }
+
+  /**
+   * Drive the missions state machine from the player's vehicle position: start an available
+   * mission by driving into its start marker, advance the active one on reaching its current
+   * checkpoint (paying the reward and saving on completion), and tick its timeout / wreck / "out of
+   * the vehicle too long" failure clock. A no-op beyond the (cheap) timer tick while on foot.
+   */
+  private updateMissions(dt: number): void {
+    const inVehicle = this.mode === 'vehicle' && this.currentVehicle !== null;
+    const wrecked = inVehicle && this.currentVehicle!.damage >= 1;
+    const wasActive = this.missions.activeId;
+    this.missions = stepActiveMission(this.missions, dt, { inVehicle, wrecked });
+    if (wasActive && this.missions.activeId === null && this.missions.runtime[wasActive]?.status === 'failed') {
+      this.hud.showToast('Mission failed');
+    }
+    // Failed missions are only transiently 'failed' (for the toast above) — this ticks each one's
+    // retry cooldown back down to 'available' so its start marker reappears and it can be retried,
+    // rather than being permanently exhausted after one bad attempt.
+    this.missions = reviveFailedMissions(this.missions, dt);
+    if (!inVehicle) return;
+    const v = this.currentVehicle!;
+    if (this.missions.activeId === null) {
+      for (const def of this.missionDefs) {
+        if (this.missions.runtime[def.id]?.status !== 'available') continue;
+        if (Math.hypot(v.state.x - def.start.x, v.state.z - def.start.z) > CHECKPOINT_RADIUS) continue;
+        this.missions = startMission(this.missions, def.id);
+        this.hud.showToast(def.type === 'race' ? 'Race started' : 'Delivery started');
+        break;
+      }
+      return;
+    }
+    const target = activeCheckpoint(this.missions);
+    if (!target || Math.hypot(v.state.x - target.x, v.state.z - target.z) > CHECKPOINT_RADIUS) return;
+    const id = this.missions.activeId;
+    const moneyBefore = this.missions.money;
+    this.missions = advanceCheckpoint(this.missions, id);
+    if (this.missions.money > moneyBefore) {
+      this.hud.showToast(`Mission complete +$${this.missions.money - moneyBefore}`);
+      saveMissionsSave(this.storage, { money: this.missions.money, completedIds: [...this.missions.completedIds] });
+    }
+  }
+
+  /** Build the world-marker list for `missionMarkers.update`: one glowing column per still-
+   *  `'available'` mission's start, plus (when a mission is active) one at its current checkpoint —
+   *  refreshed in place in the caller-owned scratch array, no per-frame allocation. */
+  private refreshMissionMarkers(): readonly MarkerInput[] {
+    let n = 0;
+    for (const def of this.missionDefs) {
+      if (this.missions.runtime[def.id]?.status === 'available') this.setMissionMarker(n++, def.start.x, def.start.z, 'start');
+    }
+    const target = activeCheckpoint(this.missions);
+    if (target) this.setMissionMarker(n++, target.x, target.z, 'checkpoint');
+    this.missionMarkerScratch.length = n;
+    return this.missionMarkerScratch;
+  }
+
+  /** Write one marker into slot `i` of `missionMarkerScratch`, reusing the object already there
+   *  (the array only ever grows, like the marker mesh pool itself) so a rendered frame allocates
+   *  nothing here — not even a closure. */
+  private setMissionMarker(i: number, x: number, z: number, kind: MarkerInput['kind']): void {
+    const slot = this.missionMarkerScratch[i];
+    if (slot) {
+      slot.x = x;
+      slot.z = z;
+      slot.kind = kind;
+    } else {
+      this.missionMarkerScratch[i] = { x, z, kind };
+    }
   }
 
   // --- time of day -----------------------------------------------------------
@@ -653,6 +768,7 @@ export class Game {
     this.traffic.update(dt, this.trafficFocus(), this.grid, this.trafficVehiclesAndPolice, this.onTrafficImpact);
     this.pedestrians.update(dt, this.trafficFocus(), this.grid, this.refreshPedestrianObstacles(), (speed) => this.events.emit('pedestrianHit', { speed }));
     this.updatePolice(dt);
+    this.updateMissions(dt);
   }
 
   /** Wanted decay/level, police spawn/despawn + pursuit, and the busted state machine. */
@@ -888,18 +1004,32 @@ export class Game {
     // sequences stay reproducible — see `Rain.update`'s doc comment.
     this.rain.update(this.camera.position.x, this.camera.position.y, this.camera.position.z, this.engine.stats.simTime, this.weather.rainVisual);
     this.gfx.pipeline?.setWetness(this.weather.wetness);
+    this.missionMarkers.update(this.refreshMissionMarkers(), this.engine.stats.simTime);
     this.gfx.render(frameDelta);
 
-    this.minimap.update(frameDelta, () => ({
-      playerX: target.position.x,
-      playerZ: target.position.z,
-      playerHeading: target.heading,
-      // `traffic.obstacles` is the system's own persistent, post-step view — reading it here keeps
-      // the (throttled) minimap redraw free of per-redraw allocation.
-      traffic: this.traffic.obstacles,
-      pedestrians: this.pedestrians.positions,
-      police: this.refreshPoliceDots(),
-    }));
+    this.minimap.update(frameDelta, () => {
+      // Only built when a redraw is actually due (see `Minimap.update`'s doc comment), same as the
+      // `dot` closure inside `Minimap.redraw` itself — a small allocation at 10 Hz, not per frame.
+      const missionStarts: { x: number; z: number }[] = [];
+      let missionCheckpoint: { x: number; z: number } | null = null;
+      for (const def of this.missionDefs) {
+        if (this.missions.runtime[def.id]?.status === 'available') missionStarts.push(def.start);
+      }
+      const target2 = activeCheckpoint(this.missions);
+      if (target2) missionCheckpoint = target2;
+      return {
+        playerX: target.position.x,
+        playerZ: target.position.z,
+        playerHeading: target.heading,
+        // `traffic.obstacles` is the system's own persistent, post-step view — reading it here keeps
+        // the (throttled) minimap redraw free of per-redraw allocation.
+        traffic: this.traffic.obstacles,
+        pedestrians: this.pedestrians.positions,
+        police: this.refreshPoliceDots(),
+        missionStarts,
+        missionCheckpoint,
+      };
+    });
 
     this.hudAccum += frameDelta;
     if (this.hudAccum > 0.25) {
@@ -940,7 +1070,33 @@ export class Game {
       hint: this.hint,
       wanted: this.wanted.level,
       busted: this.busted,
+      money: this.missions.money,
+      mission: this.missionHudLabel(),
     });
+  }
+
+  /** Active mission's next-checkpoint readout for the HUD — a compass arrow pointing at it (see
+   *  `Missions.relativeBearing`, so it follows the project's heading convention), the leg label, the
+   *  distance and the seconds left on the clock — or `null` when no mission is active. */
+  private missionHudLabel(): { label: string; arrow: string; distanceM: number; timeRemainingS: number } | null {
+    const id = this.missions.activeId;
+    if (!id) return null;
+    const target = activeCheckpoint(this.missions);
+    if (!target) return null;
+    const def = this.missionDefs.find((d) => d.id === id);
+    if (!def) return null;
+    const r = this.missions.runtime[id]!;
+    const label =
+      def.type === 'race'
+        ? `Race · checkpoint ${r.checkpointIndex + 1}/${def.checkpoints.length}`
+        : r.checkpointIndex === 0
+          ? 'Delivery · pickup'
+          : 'Delivery · dropoff';
+    // Bearing is taken from whatever the player is currently controlling (their car, or themselves
+    // on foot mid-delivery), which is also what the chase camera looks along.
+    const p = this.mode === 'vehicle' && this.currentVehicle ? this.currentVehicle.state : this.player.state;
+    const arrow = bearingArrow(relativeBearing(p.x, p.z, p.heading, target.x, target.z));
+    return { label, arrow, distanceM: Math.hypot(target.x - p.x, target.z - p.z), timeRemainingS: r.timeRemaining };
   }
 
   resize(cssWidth: number, cssHeight: number): void {
@@ -979,6 +1135,7 @@ export class Game {
     this.headlightTargetR.removeFromParent();
     this.localLights.dispose();
     this.rain.dispose();
+    this.missionMarkers.dispose();
     for (const v of this.vehicles) v.dispose(this.registry);
     this.traffic.dispose();
     this.pedestrians.dispose();

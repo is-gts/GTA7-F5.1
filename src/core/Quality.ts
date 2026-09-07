@@ -77,6 +77,11 @@ export interface QualitySettings {
   /** SSR G-buffer + reflection-buffer resolution multiplier relative to the render target (unused,
    *  but still defined, while `ssr` is false). */
   ssrScale: number;
+  /** Radial segments of a mission marker column (`render/MissionMarkers.ts`). Only a handful of
+   *  small unlit cylinders exist at a time, so this is cosmetic smoothness rather than a real
+   *  scalability lever — but it is still a preset field (not a `preset === 'low'` branch) so a
+   *  custom settings profile keeps a defined value like every other cost knob. */
+  markerSegments: number;
 }
 
 export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
@@ -112,6 +117,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     rainStreaks: 600,
     ssr: false,
     ssrScale: 0.5,
+    markerSegments: 8,
   },
   medium: {
     preset: 'medium',
@@ -145,6 +151,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     rainStreaks: 1500,
     ssr: false,
     ssrScale: 0.5,
+    markerSegments: 14,
   },
   high: {
     preset: 'high',
@@ -178,6 +185,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     rainStreaks: 4000,
     ssr: true,
     ssrScale: 0.5,
+    markerSegments: 14,
   },
   ultra: {
     preset: 'ultra',
@@ -211,6 +219,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     rainStreaks: 6000,
     ssr: true,
     ssrScale: 0.75,
+    markerSegments: 18,
   },
 };
 
