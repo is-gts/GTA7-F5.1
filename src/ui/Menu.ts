@@ -38,6 +38,9 @@ export interface MenuCallbacks {
   getGameplay(): GameplaySettings;
   getTimeOfDay(): number;
   getWeather(): WeatherStateName;
+  /** `AudioEngine.snapshot.muted` — whether the M key / this checkbox has muted the master bus. */
+  getAudioMuted(): boolean;
+  onMuteChange(muted: boolean): void;
   /** Called when the menu opens or closes (pauses/resumes the game, unlocks the pointer). */
   onOpenChange(open: boolean): void;
   /** A preset button (or "Reset to preset") was clicked: replace the whole quality object. */
@@ -138,6 +141,7 @@ export class Menu {
   private readonly todInput: HTMLInputElement;
   private readonly todValueEl: HTMLElement;
   private readonly weatherInput: HTMLSelectElement;
+  private readonly muteInput: HTMLInputElement;
   private readonly qualityInputs = new Map<string, HTMLInputElement | HTMLSelectElement>();
   private readonly gameplayInputs = new Map<string, HTMLInputElement | HTMLSelectElement>();
   private readonly valueLabels = new Map<string, HTMLElement>();
@@ -176,6 +180,13 @@ export class Menu {
             </label>
             ${GAMEPLAY_KNOBS.map((k) => this.knobHtml(k)).join('')}
           </section>
+          <section class="sm-section">
+            <h3>Audio</h3>
+            <label class="sm-row" data-key="mute">
+              <span class="sm-label">Mute</span>
+              <input type="checkbox" data-key="mute" />
+            </label>
+          </section>
         </div>
         <div class="sm-footer">
           <button type="button" class="sm-btn" data-action="reset">Reset to preset</button>
@@ -195,6 +206,7 @@ export class Menu {
     this.todInput = this.root.querySelector('input[data-key="timeOfDay"]')!;
     this.todValueEl = this.root.querySelector('[data-key-value="timeOfDay"]')!;
     this.weatherInput = this.root.querySelector('select[data-key="weather"]')!;
+    this.muteInput = this.root.querySelector('input[data-key="mute"]')!;
 
     for (const k of QUALITY_KNOBS) this.qualityInputs.set(k.key, this.root.querySelector(`[data-key="${k.key}"]`)!);
     for (const k of GAMEPLAY_KNOBS) this.gameplayInputs.set(k.key, this.root.querySelector(`[data-key="${k.key}"]`)!);
@@ -257,6 +269,8 @@ export class Menu {
       const v = this.weatherInput.value;
       if (isWeatherStateName(v)) this.cb.onWeather(v);
     });
+
+    this.muteInput.addEventListener('change', () => this.cb.onMuteChange(this.muteInput.checked));
 
     for (const k of QUALITY_KNOBS) this.wireKnob(k, this.qualityInputs, (patch) => this.queueQuality(patch, !k.debounce));
     for (const k of GAMEPLAY_KNOBS) this.wireKnob(k, this.gameplayInputs, (patch) => this.queueGameplay(patch, !k.debounce));
@@ -348,6 +362,7 @@ export class Menu {
       this.todValueEl.textContent = formatHours(hours);
     }
     this.weatherInput.value = this.cb.getWeather();
+    this.muteInput.checked = this.cb.getAudioMuted();
   }
 
   private refreshKnob(k: Knob, inputs: Map<string, HTMLInputElement | HTMLSelectElement>, source: Record<string, unknown>, q: QualitySettings): void {
@@ -455,6 +470,9 @@ export class Menu {
       this.refreshFromState();
     } else if (key === 'weather' && isWeatherStateName(value)) {
       this.cb.onWeather(value);
+      this.refreshFromState();
+    } else if (key === 'mute') {
+      this.cb.onMuteChange(Boolean(value));
       this.refreshFromState();
     } else if (isQualitySettingsKey(key)) {
       this.applyQualityPatch({ [key]: value } as Partial<QualitySettings>);

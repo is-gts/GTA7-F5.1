@@ -29,6 +29,8 @@ export interface InputState {
   lookBack: boolean;
   /** 1-4 when a quality hotkey was pressed this frame, else 0. */
   qualityPressed: number;
+  /** Edge-triggered: `M` was pressed this frame (audio mute toggle). */
+  mutePressed: boolean;
 }
 
 export function createEmptyInputState(): InputState {
@@ -49,6 +51,7 @@ export function createEmptyInputState(): InputState {
     lookDY: 0,
     lookBack: false,
     qualityPressed: 0,
+    mutePressed: false,
   };
 }
 
@@ -75,6 +78,7 @@ const KEY_BINDINGS = {
   pause: ['Escape', 'KeyP'],
   horn: ['KeyH'],
   lookBack: ['KeyC'],
+  mute: ['KeyM'],
   quality1: ['Digit1'],
   quality2: ['Digit2'],
   quality3: ['Digit3'],
@@ -238,6 +242,7 @@ export class Input {
     s.cameraTogglePressed = this.wasPressed('cameraToggle') || this.virtualPress.has('cameraToggle');
     s.pausePressed = this.wasPressed('pause') || gp.pausePressed;
     s.hornPressed = this.wasPressed('horn') || this.virtualPress.has('horn');
+    s.mutePressed = this.wasPressed('mute');
     s.lookBack = this.isDown('lookBack');
     s.qualityPressed = this.wasPressed('quality1') ? 1 : this.wasPressed('quality2') ? 2 : this.wasPressed('quality3') ? 3 : this.wasPressed('quality4') ? 4 : 0;
 

@@ -82,6 +82,10 @@ export interface QualitySettings {
    *  scalability lever — but it is still a preset field (not a `preset === 'low'` branch) so a
    *  custom settings profile keeps a defined value like every other cost knob. */
   markerSegments: number;
+  /** Max simultaneous pooled traffic-engine audio voices (`audio/AudioEngine.ts`) — trivially cheap
+   *  (a handful of WebAudio nodes) but still a preset field, like `markerSegments`, so a custom
+   *  settings profile keeps a defined value like every other cost knob. */
+  audioTrafficVoices: number;
 }
 
 export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
@@ -118,6 +122,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     ssr: false,
     ssrScale: 0.5,
     markerSegments: 8,
+    audioTrafficVoices: 2,
   },
   medium: {
     preset: 'medium',
@@ -152,6 +157,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     ssr: false,
     ssrScale: 0.5,
     markerSegments: 14,
+    audioTrafficVoices: 3,
   },
   high: {
     preset: 'high',
@@ -186,6 +192,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     ssr: true,
     ssrScale: 0.5,
     markerSegments: 14,
+    audioTrafficVoices: 4,
   },
   ultra: {
     preset: 'ultra',
@@ -220,6 +227,7 @@ export const QUALITY_PRESETS: Record<QualityPresetName, QualitySettings> = {
     ssr: true,
     ssrScale: 0.75,
     markerSegments: 18,
+    audioTrafficVoices: 4,
   },
 };
 

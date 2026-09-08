@@ -139,6 +139,7 @@ const api = {
       input: { virtual: { ...game.input.virtual } },
       touch: game.touch !== null,
       weather: { state: game.weather.state, wetness: game.weather.wetness, rainVisual: game.weather.rainVisual },
+      audio: game.audio.snapshot,
     };
   },
   /** Render a frame and sample the default framebuffer: mean/variance of luminance over a grid. */

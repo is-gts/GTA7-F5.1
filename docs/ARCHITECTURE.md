@@ -19,6 +19,9 @@ src/
   game/      Game (composition root: update/render systems, enter/exit vehicle, time of day, quality),
              Wanted (pure heat/level state machine behind police spawns and the busted rule)
   ui/        HUD (DOM overlay), Minimap (cached road layer + throttled dynamic dots)
+  audio/     AudioModel (pure DSP parameter mapping: RPM/gear, crash amplitude, siren schedule,
+             distance attenuation), AudioEngine (the WebAudio node graph — lazy AudioContext on the
+             first real user gesture, synthesised engine/screech/siren/traffic/ambient/horn/crash)
   main.ts    bootstrap, URL parameters, window.__gta7 debug/automation API
 tests/       vitest unit tests (pure modules only — no WebGL)
 e2e/         Playwright smoke tests against the production build (headless SwiftShader)

@@ -5,6 +5,7 @@ import { Color, Object3D, PerspectiveCamera, Scene, SpotLight, Vector3 } from 't
 import { obstacleFromVehicle, TrafficSystem, type TrafficObstacle } from '../ai/Traffic';
 import { PedestrianSystem } from '../ai/Pedestrians';
 import { PoliceSystem, RAM_STOP_GAP, type PoliceFocus } from '../ai/Police';
+import { AudioEngine, TRAFFIC_VOICE_POOL_SIZE, type TrafficVoiceSample } from '../audio/AudioEngine';
 import { Engine } from '../core/Engine';
 import { EventBus } from '../core/EventBus';
 import { Input } from '../core/Input';
@@ -141,6 +142,13 @@ export class Game {
   readonly engine = new Engine({ fixedDelta: 1 / 60 });
   readonly input = new Input();
   readonly registry = new MaterialRegistry();
+  /** Procedural WebAudio engine (see `audio/AudioEngine.ts`): lazily started on the first real user
+   *  gesture, always a safe no-op before that (or if WebAudio is unavailable). */
+  readonly audio = new AudioEngine();
+  /** Nearest traffic cars sampled for the pooled engine-voice audio (see `updateAudio`), ascending
+   *  by distance — a persistent, fixed-size scratch buffer (size `TRAFFIC_VOICE_POOL_SIZE`) refreshed
+   *  in place each tick so audio sampling allocates nothing. */
+  private readonly audioTrafficScratch: TrafficVoiceSample[] = Array.from({ length: TRAFFIC_VOICE_POOL_SIZE }, () => ({ distance: Infinity, speed: 0 }));
   /** Gameplay events (currently: `pedestrianHit`), for later systems (wanted level, HUD feedback). */
   readonly events = new EventBus<GameEvents>();
   readonly scene = new Scene();
@@ -344,6 +352,7 @@ export class Game {
     this.scene.add(this.pedestrians.object);
     // Horn: nearby pedestrians flee, whether or not a vehicle is actually closing on them.
     this.events.on('horn', ({ x, z }) => this.pedestrians.startle(x, z, HORN_RADIUS));
+    this.events.on('horn', () => this.audio.playHorn());
 
     this.police = new PoliceSystem(this.registry, this.city.params.seed);
     this.minimap = new Minimap(opts.hudContainer, this.city);
@@ -351,6 +360,12 @@ export class Game {
     this.events.on('pedestrianHit', () => (this.wanted = addWantedHeat(this.wanted, 'pedestrianHit')));
     this.events.on('vehicleCrash', () => (this.wanted = addWantedHeat(this.wanted, 'vehicleCrash')));
     this.events.on('policeContact', () => (this.wanted = addWantedHeat(this.wanted, 'policeContact')));
+    // Crash thuds: vehicle-vehicle/traffic/police hits go through the game event (already
+    // impulse-thresholded for the wanted system); static-geometry hits (kerbs, buildings) are
+    // sampled straight off `VehicleEntity.lastCollision` each tick in `updateAudio` — either path
+    // is rate-limited inside `AudioEngine.playCrash` so both can fire the same tick safely.
+    this.events.on('vehicleCrash', ({ impulse }) => this.audio.playCrash(impulse));
+    this.events.on('policeContact', ({ impulse }) => this.audio.playCrash(impulse));
 
     this.cameraRig = new CameraRig(this.camera, this.grid);
     this.cameraRig.baseFov = this.gameplay.fov;
@@ -361,6 +376,8 @@ export class Game {
       getGameplay: () => this.gameplay,
       getTimeOfDay: () => this.clock.hours,
       getWeather: () => this.weather.state,
+      getAudioMuted: () => this.audio.muted,
+      onMuteChange: (muted) => this.audio.setMuted(muted),
       onOpenChange: (open) => {
         this.paused = open;
         if (open) {
@@ -381,6 +398,13 @@ export class Game {
     });
     const showTouch = opts.touch ?? isTouchDevice();
     this.touch = showTouch ? new TouchControls(opts.canvas, opts.hudContainer, this.input, () => this.menu.open()) : null;
+
+    // Audio: never construct the AudioContext before a real gesture — see `AudioEngine`'s header.
+    // Registered on `window` (not `opts.canvas`) so it fires regardless of whether `start()` is
+    // ever called (e.g. a caller that only renders single frames), same reach as a real player's
+    // keyboard/mouse/touch input.
+    this.audio.attachGestureListeners(typeof window !== 'undefined' ? window : null);
+    this.audio.setTrafficBudget(this.quality.audioTrafficVoices);
 
     this.gfx.applyQuality(this.quality, this.scene, this.camera, this.dpr);
     this.applyTimeOfDay(true);
@@ -441,6 +465,7 @@ export class Game {
     this.traffic.rebuild(q, this.trafficFocus());
     this.pedestrians.rebuild(q, this.trafficFocus());
     this.missionMarkers.setQuality(q.markerSegments);
+    this.audio.setTrafficBudget(q.audioTrafficVoices);
     this.applyTimeOfDay(true);
     this.syncHeadlights();
     saveQuality(this.storage, q, this.gameplayForStorage());
@@ -704,6 +729,10 @@ export class Game {
       const name = (['low', 'medium', 'high', 'ultra'] as const)[inp.qualityPressed - 1];
       if (name && isPresetName(name) && name !== this.quality.preset) this.setQualityPreset(name);
     }
+    if (inp.mutePressed && !this.paused) this.audio.toggleMute();
+    // A paused game (settings menu open) is a silent one: without this the engine/siren/rain beds
+    // hold their last parameters and keep droning behind the menu. Idempotent, so this is free.
+    this.audio.setPaused(this.paused);
     if (this.paused) return;
     this.updateClock(dt);
     this.weather = stepWeather(this.weather, dt, this.weatherRng);
@@ -720,6 +749,10 @@ export class Game {
         const v = this.currentVehicle;
         if (inp.hornPressed) this.events.emit('horn', { x: v.state.x, z: v.state.z, heading: v.state.heading });
         v.step(dt, { throttle: inp.throttle, brake: inp.brake, steer: inp.steer, handbrake: inp.handbrake }, this.grid);
+        // Static-geometry crash (kerb/building), as opposed to the vehicle-vehicle hits reported
+        // through the `vehicleCrash` game event above — `AudioEngine.playCrash` rate-limits, so a
+        // tick that also emits `vehicleCrash` never double-thuds.
+        if (v.lastCollision) this.audio.playCrash(v.lastCollision.impulse);
         for (const other of this.vehicles) {
           if (other === v) continue;
           if (Math.hypot(other.state.x - v.state.x, other.state.z - v.state.z) > 12) continue;
@@ -769,6 +802,59 @@ export class Game {
     this.pedestrians.update(dt, this.trafficFocus(), this.grid, this.refreshPedestrianObstacles(), (speed) => this.events.emit('pedestrianHit', { speed }));
     this.updatePolice(dt);
     this.updateMissions(dt);
+    this.updateAudio();
+  }
+
+  /**
+   * Feed the current simulation state (engine RPM/throttle, tyre slip, weather, nearby traffic,
+   * pursuing police) into `AudioEngine.update` once per fixed tick, from the moment a real user
+   * gesture has started audio (see `AudioEngine`'s header) and not before.
+   */
+  private updateAudio(): void {
+    // Nothing has been created until a real gesture starts audio (see `AudioEngine`'s header), and
+    // `AudioEngine.update` is a no-op until then — so skip the nearest-traffic scan too.
+    if (!this.audio.started) return;
+    const driving = this.mode === 'vehicle' && this.currentVehicle !== null;
+    const v = this.currentVehicle;
+    const focus = this.trafficFocus();
+    this.audio.update({
+      simTime: this.engine.stats.simTime,
+      driving,
+      speed: v ? v.state.forwardSpeed : 0,
+      throttle: this.input.state.throttle,
+      lateralSpeed: v ? v.state.lateralSpeed : 0,
+      handbrake: this.input.state.handbrake,
+      wetness: this.weather.wetness,
+      traffic: this.refreshAudioTraffic(focus),
+      policeDistance: this.police.nearestDistance(focus.x, focus.z),
+      pursuing: this.policePursuing,
+    });
+  }
+
+  /**
+   * The nearest `TRAFFIC_VOICE_POOL_SIZE` traffic agents to `focus`, ascending by distance, written
+   * into `audioTrafficScratch` in place (a fixed-size insertion scan — cheap for the handful of
+   * slots involved, and, unlike sorting the whole traffic population, allocates nothing).
+   */
+  private refreshAudioTraffic(focus: { x: number; z: number }): readonly TrafficVoiceSample[] {
+    const scratch = this.audioTrafficScratch;
+    for (const slot of scratch) {
+      slot.distance = Infinity;
+      slot.speed = 0;
+    }
+    for (const ob of this.traffic.obstacles) {
+      const d = Math.hypot(ob.x - focus.x, ob.z - focus.z);
+      if (d >= scratch[scratch.length - 1]!.distance) continue;
+      let i = scratch.length - 1;
+      while (i > 0 && scratch[i - 1]!.distance > d) {
+        scratch[i]!.distance = scratch[i - 1]!.distance;
+        scratch[i]!.speed = scratch[i - 1]!.speed;
+        i--;
+      }
+      scratch[i]!.distance = d;
+      scratch[i]!.speed = ob.forwardSpeed;
+    }
+    return scratch;
   }
 
   /** Wanted decay/level, police spawn/despawn + pursuit, and the busted state machine. */
@@ -1129,6 +1215,7 @@ export class Game {
 
   dispose(): void {
     this.stop();
+    this.audio.dispose();
     this.headlightL.removeFromParent();
     this.headlightR.removeFromParent();
     this.headlightTargetL.removeFromParent();
